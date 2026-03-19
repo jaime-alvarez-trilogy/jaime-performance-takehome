@@ -144,6 +144,9 @@ class TestFR3EmitAluHashStages(unittest.TestCase):
         # Set initial values in scratch: a_D[0..7] = known input
         test_inputs = [0x12345678 + i for i in range(VLEN)]
         scratch = [0] * SCRATCH_SIZE
+        # Pre-populate all scalar constants so ALU simulation reads correct values
+        for val, addr in kb.const_map.items():
+            scratch[addr] = val & 0xFFFFFFFF
         for i in range(VLEN):
             scratch[a_D + i] = test_inputs[i]
 

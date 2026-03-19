@@ -320,6 +320,42 @@ class KernelBuilder:
             flow_schedule=flow_schedule, preloaded_loads=preloaded_loads
         )
 
+    def _emit_alu_hash_stages(self, alu_group_addr, stage_start=0, stage_end=6):
+        """
+        Generate ALU ops for one group's 6-stage hash pipeline using scratch addresses.
+        Returns a list of cycles (each cycle is a list of (op, dest, src1, src2) tuples).
+
+        Total: 15 cycles for stages 0-5:
+          - Mul stages (0, 2, 4): 2 cycles each (8 multiply + 8 add = 16 ops)
+          - XOR stages (1, 3, 5): 3 cycles each (8 op1 + 8 op3 + 8 op2 = 24 ops)
+
+        alu_group_addr: (a_base, tmp1_base, tmp2_base) scratch addresses for VLEN lanes.
+        The ALU hash computes the same result as the VALU hash on each lane independently.
+        """
+        a_base, tmp1_base, tmp2_base = alu_group_addr
+        cycles = []
+        for hi in range(stage_start, stage_end):
+            op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+            is_mul = (op1 == "+" and op2 == "+" and op3 == "<<")
+            if is_mul:
+                factor = (1 + (1 << val3)) & 0xFFFFFFFF
+                c_factor = self.const_map[factor]
+                c_C = self.const_map[val1]
+                # Cycle 1: a = a * factor (= a * (1+2^val3))
+                cycles.append([("*", a_base + i, a_base + i, c_factor) for i in range(VLEN)])
+                # Cycle 2: a = a + C (= a + val1)
+                cycles.append([("+", a_base + i, a_base + i, c_C) for i in range(VLEN)])
+            else:
+                c_val1 = self.const_map[val1]
+                c_val3 = self.const_map[val3]
+                # Cycle 1: tmp1 = a op1 val1  (reads old a)
+                cycles.append([(op1, tmp1_base + i, a_base + i, c_val1) for i in range(VLEN)])
+                # Cycle 2: tmp2 = a op3 val3  (reads old a — not tmp1, preserving myhash semantics)
+                cycles.append([(op3, tmp2_base + i, a_base + i, c_val3) for i in range(VLEN)])
+                # Cycle 3: a = tmp1 op2 tmp2
+                cycles.append([(op2, a_base + i, tmp1_base + i, tmp2_base + i) for i in range(VLEN)])
+        return cycles
+
     def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
         slots = []
 
