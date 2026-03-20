@@ -36,6 +36,402 @@ from problem import (
     reference_kernel2,
 )
 
+# ── Spec 06: DAG Scheduler Foundation ────────────────────────────────────────
+
+from dataclasses import dataclass, field as dc_field
+
+
+@dataclass
+class Op:
+    """Models a single machine operation for DAG scheduling."""
+    engine: str           # 'valu'|'alu'|'load'|'store'|'flow'
+    instr: tuple          # complete instruction tuple for to_instr_dict
+    dst: int              # scratch address written (−1 if none)
+    dep_srcs: list        # scratch addresses READ (for dep analysis; excludes literal ints)
+    context_id: int       # group index within the pass (0-based)
+    round_id: int         # round (0–15)
+    stage: int            # intra-round ordering (0-based)
+    deps: list = dc_field(default_factory=list)   # Op objects this depends on
+    lat: int = 1          # output-ready latency
+
+
+@dataclass
+class ScratchLayout:
+    """Per-context scratch address layout for DAG scheduler."""
+    n_contexts: int
+    context_bases: list    # context_bases[i] = base addr for context i's new 32-word block
+    val_bases: list        # val_bases[i] = val_base + group_ids[i] * VLEN
+    idx_bases: list        # idx_bases[i] = idx_base + group_ids[i] * VLEN
+
+    NV_OFF   = 0     # nv_buf:   8 words
+    TMP1_OFF = 8     # tmp1:     8 words
+    TMP2_OFF = 16    # tmp2:     8 words
+    ADDR_OFF = 24    # addr_buf: 8 words
+    TNAV_OFF = 32    # tmp_nav:  8 words
+    TVLD_OFF = 40    # tmp_vld:  8 words
+    WORDS_PER_CTX = 48   # 6 × 8 words per context
+
+    def nv_buf(self, ctx):   return self.context_bases[ctx] + ScratchLayout.NV_OFF
+    def tmp1(self, ctx):     return self.context_bases[ctx] + ScratchLayout.TMP1_OFF
+    def tmp2(self, ctx):     return self.context_bases[ctx] + ScratchLayout.TMP2_OFF
+    def addr_buf(self, ctx): return self.context_bases[ctx] + ScratchLayout.ADDR_OFF
+    def tmp_nav(self, ctx):  return self.context_bases[ctx] + ScratchLayout.TNAV_OFF
+    def tmp_vld(self, ctx):  return self.context_bases[ctx] + ScratchLayout.TVLD_OFF
+    def val_buf(self, ctx):  return self.val_bases[ctx]
+    def idx_buf(self, ctx):  return self.idx_bases[ctx]
+
+
+def allocate_scratch(n_contexts, base_offset, val_base, idx_base, group_ids):
+    """Allocate per-context scratch, reusing val/idx arrays from setup phase."""
+    total = base_offset + n_contexts * ScratchLayout.WORDS_PER_CTX
+    assert total <= SCRATCH_SIZE, (
+        f"Scratch overflow: need {total} words, have {SCRATCH_SIZE}"
+    )
+    context_bases = [base_offset + i * ScratchLayout.WORDS_PER_CTX
+                     for i in range(n_contexts)]
+    val_bases = [val_base + g * VLEN for g in group_ids]
+    idx_bases = [idx_base + g * VLEN for g in group_ids]
+    return ScratchLayout(
+        n_contexts=n_contexts,
+        context_bases=context_bases,
+        val_bases=val_bases,
+        idx_bases=idx_bases,
+    )
+
+
+class Bundle:
+    """One VLIW instruction cycle: enforces SLOT_LIMITS per engine."""
+    _LIMITS = {k: v for k, v in SLOT_LIMITS.items() if k != 'debug'}
+
+    def __init__(self):
+        self._slots = {eng: [] for eng in self._LIMITS}
+
+    def can_fit(self, op):
+        eng = op.engine
+        return len(self._slots.get(eng, [])) < self._LIMITS.get(eng, 0)
+
+    def add(self, op):
+        assert self.can_fit(op), f"Bundle overflow: engine={op.engine}"
+        self._slots[op.engine].append(op)
+
+    def is_empty(self):
+        return all(len(v) == 0 for v in self._slots.values())
+
+    def to_instr_dict(self):
+        result = {}
+        for eng, ops in self._slots.items():
+            if ops:
+                result[eng] = [op.instr for op in ops]
+        return result
+
+
+def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nnodes):
+    """
+    Generate all Ops for a set of contexts/rounds with populated deps.
+
+    contexts: list of local context indices (0-based, into scratch layout)
+    rounds:   list of round indices (0–15)
+    scratch:  ScratchLayout
+    hsc_new:  hash stage constants list from KernelBuilder
+    v_fp, v_one, v_nnodes: constant scratch addresses
+    """
+    n_rounds = len(rounds)
+    last_round = rounds[-1]
+    all_ops = []
+
+    for ctx in contexts:
+        val_buf  = scratch.val_buf(ctx)
+        idx_buf  = scratch.idx_buf(ctx)
+        nv_buf   = scratch.nv_buf(ctx)
+        tmp1     = scratch.tmp1(ctx)
+        tmp2     = scratch.tmp2(ctx)
+        addr_buf = scratch.addr_buf(ctx)
+        tmp_nav  = scratch.tmp_nav(ctx)
+        tmp_vld  = scratch.tmp_vld(ctx)
+
+        ctx_ops = []
+
+        for r in rounds:
+            # Stage counter per round
+            s = 0
+
+            # ── Stage 0: addr_buf = v_fp + idx_buf ──────────────────────────
+            op_addr = Op(
+                engine='valu',
+                instr=('+', addr_buf, v_fp, idx_buf),
+                dst=addr_buf,
+                dep_srcs=[v_fp, idx_buf],
+                context_id=ctx, round_id=r, stage=s,
+            )
+            ctx_ops.append(op_addr)
+            s += 1
+
+            # ── Stages 1–4: scatter load nv_buf (4 load pairs = 8 ops) ─────
+            # Each load_offset writes to nv_buf+vi (one word per op).
+            # Track individual words for accurate dep analysis.
+            load_ops_this_round = []
+            for vi in range(0, VLEN, 2):
+                op_ld0 = Op(
+                    engine='load',
+                    instr=('load_offset', nv_buf, addr_buf, vi),
+                    dst=nv_buf + vi,        # individual word destination
+                    dep_srcs=[addr_buf],    # reads the base address (all VLEN words)
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                op_ld1 = Op(
+                    engine='load',
+                    instr=('load_offset', nv_buf, addr_buf, vi + 1),
+                    dst=nv_buf + vi + 1,    # individual word destination
+                    dep_srcs=[addr_buf],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_ld0)
+                ctx_ops.append(op_ld1)
+                load_ops_this_round.append(op_ld0)
+                load_ops_this_round.append(op_ld1)
+                s += 1
+
+            # ── Stage 5: val_buf ^= nv_buf ──────────────────────────────────
+            # Reads all VLEN words of nv_buf — must wait for ALL 8 loads.
+            op_xor = Op(
+                engine='valu',
+                instr=('^', val_buf, val_buf, nv_buf),
+                dst=val_buf,
+                dep_srcs=[val_buf] + [nv_buf + vi for vi in range(VLEN)],
+                context_id=ctx, round_id=r, stage=s,
+            )
+            ctx_ops.append(op_xor)
+            s += 1
+
+            # ── Stages 6–14: hash (9 VALU cycles) ──────────────────────────
+            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                is_mul = (op1 == "+" and op2 == "+" and op3 == "<<")
+                stage_info = hsc_new[hi]
+
+                if is_mul:
+                    _, v_factor, v_C = stage_info
+                    op_hash = Op(
+                        engine='valu',
+                        instr=('multiply_add', val_buf, val_buf, v_factor, v_C),
+                        dst=val_buf,
+                        dep_srcs=[val_buf, v_factor, v_C],
+                        context_id=ctx, round_id=r, stage=s,
+                    )
+                    ctx_ops.append(op_hash)
+                    s += 1
+                else:
+                    _, op1_s, v_c1, op2_s, op3_s, v_c2 = stage_info
+                    # Odd cycle: tmp1 = val op1 v_c1; tmp2 = val op3 v_c2
+                    op_h1 = Op(
+                        engine='valu',
+                        instr=(op1_s, tmp1, val_buf, v_c1),
+                        dst=tmp1,
+                        dep_srcs=[val_buf, v_c1],
+                        context_id=ctx, round_id=r, stage=s,
+                    )
+                    op_h2 = Op(
+                        engine='valu',
+                        instr=(op3_s, tmp2, val_buf, v_c2),
+                        dst=tmp2,
+                        dep_srcs=[val_buf, v_c2],
+                        context_id=ctx, round_id=r, stage=s,
+                    )
+                    ctx_ops.append(op_h1)
+                    ctx_ops.append(op_h2)
+                    s += 1
+                    # Even cycle: val = tmp1 op2 tmp2
+                    op_h3 = Op(
+                        engine='valu',
+                        instr=(op2_s, val_buf, tmp1, tmp2),
+                        dst=val_buf,
+                        dep_srcs=[tmp1, tmp2],
+                        context_id=ctx, round_id=r, stage=s,
+                    )
+                    ctx_ops.append(op_h3)
+                    s += 1
+
+            # ── Navigation (skip for last round) ────────────────────────────
+            # Navigation formula: idx_next = 2*idx + 1 + (val & 1)
+            #   gi_double: idx = idx * 2 + 1  (via multiply_add(idx, idx, v_two, v_one))
+            #   nav_a:     tmp_nav = val & 1  (low bit of hash output)
+            #   nav_b:     idx += tmp_nav     (adds 0 or 1)
+            #   nav_c:     tmp_vld = idx < n_nodes  (bounds check)
+            #   nav_d:     idx *= tmp_vld     (wrap OOB to 0)
+            if r != last_round:
+                # Gi-doubler: idx = idx * 2 + 1
+                op_gi_double = Op(
+                    engine='valu',
+                    instr=('multiply_add', idx_buf, idx_buf, v_two, v_one),
+                    dst=idx_buf,
+                    dep_srcs=[idx_buf, v_two, v_one],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_gi_double)
+                s += 1
+
+                # Nav A: tmp_nav = val_buf & 1
+                op_nav_a = Op(
+                    engine='valu',
+                    instr=('&', tmp_nav, val_buf, v_one),
+                    dst=tmp_nav,
+                    dep_srcs=[val_buf, v_one],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_nav_a)
+                s += 1
+
+                # Nav B: idx_buf += tmp_nav
+                op_nav_b = Op(
+                    engine='valu',
+                    instr=('+', idx_buf, idx_buf, tmp_nav),
+                    dst=idx_buf,
+                    dep_srcs=[idx_buf, tmp_nav],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_nav_b)
+                s += 1
+
+                # Nav bounds: tmp_vld = idx_buf < v_nnodes
+                op_nav_c = Op(
+                    engine='valu',
+                    instr=('<', tmp_vld, idx_buf, v_nnodes),
+                    dst=tmp_vld,
+                    dep_srcs=[idx_buf, v_nnodes],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_nav_c)
+                s += 1
+
+                # Nav multiply: idx_buf *= tmp_vld (wraps OOB indices to 0)
+                op_nav_d = Op(
+                    engine='valu',
+                    instr=('*', idx_buf, idx_buf, tmp_vld),
+                    dst=idx_buf,
+                    dep_srcs=[idx_buf, tmp_vld],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_nav_d)
+                s += 1
+
+        # ── Populate deps via last-writer analysis ───────────────────────────
+        # Process ops in round/stage order; track last writer per scratch addr
+        last_writer = {}
+        for op in ctx_ops:
+            for src in op.dep_srcs:
+                if src in last_writer:
+                    writer = last_writer[src]
+                    if writer not in op.deps:
+                        op.deps.append(writer)
+            if op.dst >= 0:
+                last_writer[op.dst] = op
+
+        all_ops.extend(ctx_ops)
+
+    return all_ops
+
+
+def list_schedule(ops):
+    """
+    Greedy list scheduler: longest-remaining-path priority.
+    Returns List[Bundle] with one bundle per cycle.
+    """
+    if not ops:
+        return []
+
+    # Build consumer graph (inverse of deps), keyed by id(op)
+    consumers = defaultdict(list)
+    for op in ops:
+        for dep in op.deps:
+            consumers[id(dep)].append(op)
+
+    # Compute longest-remaining-path (lrp) via iterative bottom-up
+    lrp = {}
+    def compute_lrp(op):
+        if id(op) in lrp:
+            return lrp[id(op)]
+        cons = consumers[id(op)]
+        if not cons:
+            lrp[id(op)] = 0
+            return 0
+        val = 1 + max(compute_lrp(c) for c in cons)
+        lrp[id(op)] = val
+        return val
+
+    import sys
+    old_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(20000)
+    try:
+        for op in ops:
+            compute_lrp(op)
+    finally:
+        sys.setrecursionlimit(old_limit)
+
+    # Scheduler state
+    dep_remaining = {id(op): len(op.deps) for op in ops}
+    scheduled_at = {}   # id(op) → cycle
+    ready = sorted(
+        [op for op in ops if len(op.deps) == 0],
+        key=lambda o: (-lrp[id(o)], o.context_id)
+    )
+
+    bundles = []
+    cycle = 0
+    total = len(ops)
+    scheduled_count = 0
+
+    while scheduled_count < total:
+        bundle = Bundle()
+        scheduled_this_cycle = []
+
+        # Build priority-sorted candidate list from ready ops
+        candidates = sorted(ready, key=lambda o: (-lrp[id(o)], o.context_id))
+
+        for op in candidates:
+            if not bundle.can_fit(op):
+                continue
+            # Check latency: all deps must have finished before this cycle
+            all_deps_ready = True
+            for dep in op.deps:
+                dep_cycle = scheduled_at.get(id(dep))
+                if dep_cycle is None or dep_cycle + dep.lat > cycle:
+                    all_deps_ready = False
+                    break
+            if not all_deps_ready:
+                continue
+
+            bundle.add(op)
+            scheduled_at[id(op)] = cycle
+            scheduled_this_cycle.append(op)
+
+        # Remove scheduled ops from ready
+        scheduled_set = {id(op) for op in scheduled_this_cycle}
+        ready = [op for op in ready if id(op) not in scheduled_set]
+        scheduled_count += len(scheduled_this_cycle)
+
+        # Unlock consumers
+        for op in scheduled_this_cycle:
+            for consumer in consumers[id(op)]:
+                dep_remaining[id(consumer)] -= 1
+                if dep_remaining[id(consumer)] == 0:
+                    ready.append(consumer)
+
+        bundles.append(bundle)
+        cycle += 1
+
+        # Safety: if nothing scheduled and ready is non-empty, it's a latency stall
+        # Just advance (stall cycle). If ready is empty and unscheduled exist, something wrong.
+        if not scheduled_this_cycle and not ready and scheduled_count < total:
+            # Stall: all ready ops blocked by latency; advance cycle
+            # Re-add all latency-blocked ops with deps satisfied
+            for op in ops:
+                if id(op) not in scheduled_at and dep_remaining[id(op)] == 0:
+                    ready.append(op)
+
+    return bundles
+
+
+# ── End Spec 06 DAG Infrastructure ───────────────────────────────────────────
+
 
 class KernelBuilder:
     def __init__(self):
@@ -390,54 +786,8 @@ class KernelBuilder:
         """
         n_groups = batch_size // VLEN  # 32 groups of 8
 
-        # ── Scratch allocation ────────────────────────────────────────────────
-        # 3-group interleaved hash: separate tmp regions per concurrent group
-        self.tmp1_A = self.alloc_scratch("tmp1_A", VLEN)
-        self.tmp1_B = self.alloc_scratch("tmp1_B", VLEN)
-        self.tmp1_C = self.alloc_scratch("tmp1_C", VLEN)
-        self.tmp2_A = self.alloc_scratch("tmp2_A", VLEN)
-        self.tmp2_B = self.alloc_scratch("tmp2_B", VLEN)
-        self.tmp2_C = self.alloc_scratch("tmp2_C", VLEN)
-        self.nv_A      = self.alloc_scratch("nv_A",      VLEN * 4)  # node values, buffer A (4 groups, k=4)
-        self.nv_B      = self.alloc_scratch("nv_B",      VLEN * 4)  # node values, buffer B (ping-pong)
-        self.addr_next = self.alloc_scratch("addr_next", VLEN * 4)  # scatter addrs for next quadruplet
-        # Spec 03 FR2: per-group nav temporaries (packed multi-group navigation)
-        tmp_nav_A = self.alloc_scratch("tmp_nav_A", VLEN)
-        tmp_nav_B = self.alloc_scratch("tmp_nav_B", VLEN)
-        tmp_nav_C = self.alloc_scratch("tmp_nav_C", VLEN)
-        tmp_vld_A = self.alloc_scratch("tmp_vld_A", VLEN)
-        tmp_vld_B = self.alloc_scratch("tmp_vld_B", VLEN)
-        tmp_vld_C = self.alloc_scratch("tmp_vld_C", VLEN)
-        self.tmp1_D = self.alloc_scratch("tmp1_D", VLEN)
-        self.tmp2_D = self.alloc_scratch("tmp2_D", VLEN)
-        tmp_nav_D = self.alloc_scratch("tmp_nav_D", VLEN)
-        tmp_vld_D = self.alloc_scratch("tmp_vld_D", VLEN)
-        tmp_s    = self.alloc_scratch("tmp_s")            # scalar scratch
-        nv_root_scalar = self.alloc_scratch("nv_root_scalar", 1)  # forest_values[0] (all gi=0 at round 0)
-        # Spec 04 FR1: scratch for software nv constants (rounds 1, 12 where gi ∈ {1,2})
-        nv1_scalar = self.alloc_scratch("nv1_scalar", 1)  # forest_values[1]
-        nv2_scalar = self.alloc_scratch("nv2_scalar", 1)  # forest_values[2]
-        nv_delta_scalar = self.alloc_scratch("nv_delta_scalar", 1)  # (nv2 - nv1) % 2^32
-        nv_base_scalar  = self.alloc_scratch("nv_base_scalar", 1)   # (nv1 - delta) % 2^32
-        v_nv_delta = self.alloc_scratch("v_nv_delta", VLEN)  # broadcast of nv_delta_scalar
-        v_nv_base  = self.alloc_scratch("v_nv_base",  VLEN)  # broadcast of nv_base_scalar
-        # Spec 04 level-2: scratch for software nv (rounds 2, 13 where gi ∈ {3..6})
-        nv3_scalar = self.alloc_scratch("nv3_scalar", 1)  # forest_values[3]
-        nv4_scalar = self.alloc_scratch("nv4_scalar", 1)  # forest_values[4]
-        nv5_scalar = self.alloc_scratch("nv5_scalar", 1)  # forest_values[5]
-        nv6_scalar = self.alloc_scratch("nv6_scalar", 1)  # forest_values[6]
-        v_nv3 = self.alloc_scratch("v_nv3", VLEN)
-        v_nv4 = self.alloc_scratch("v_nv4", VLEN)
-        v_nv5 = self.alloc_scratch("v_nv5", VLEN)
-        v_nv6 = self.alloc_scratch("v_nv6", VLEN)
-        v_five = self.alloc_scratch("v_five", VLEN)  # vbroadcast(5) for mask_A = (gi < 5)
-        # Temp buffers for 3-group FLOW-based nv computation (shared across triplets)
-        mask_A_bufs = [self.alloc_scratch(f"mask_A_{i}", VLEN) for i in range(4)]
-        nv_lo_bufs  = [self.alloc_scratch(f"nv_lo_{i}",  VLEN) for i in range(4)]
-        nv_hi_bufs  = [self.alloc_scratch(f"nv_hi_{i}",  VLEN) for i in range(4)]
-        mask_B_bufs = [self.alloc_scratch(f"mask_B_{i}", VLEN) for i in range(4)]
-
-        # Memory header pointers (loaded from mem[4..6]) — pack 2 per instruction
+        # ── Scratch allocation (Spec 06: streamlined for DAG scheduler) ────────
+        # Memory header pointers (loaded from mem[4..6])
         self.alloc_scratch("forest_values_p")
         self.alloc_scratch("inp_indices_p")
         self.alloc_scratch("inp_values_p")
@@ -451,64 +801,10 @@ class KernelBuilder:
             ("load", self.scratch["forest_values_p"], self.scratch_const(4)),
             ("load", self.scratch["inp_indices_p"],   self.scratch_const(5)),
         ]})
-        # Instruction: inp_values_p + nv_root_scalar (forest_values[0] = root node value)
-        # All inputs start at gi=0, so nv for round 0 = forest_values[0] for all groups.
-        # forest_values_p is ready (written at end of previous instruction). ✓
+        # Instruction: inp_values_p
         self.instrs.append({"load": [
             ("load", self.scratch["inp_values_p"], self.scratch_const(6)),
-            ("load", nv_root_scalar, self.scratch["forest_values_p"]),
         ]})
-
-        # ── Spec 04: Load forest_values[1..6] for software nv ───────────────
-        # Allocate ALL fp+X scratch vars upfront so we can emit one combined ALU cycle.
-        fp_plus1 = self.alloc_scratch("fp_plus1", 1)
-        fp_plus2 = self.alloc_scratch("fp_plus2", 1)
-        fp_plus3 = self.alloc_scratch("fp_plus3", 1)
-        fp_plus4 = self.alloc_scratch("fp_plus4", 1)
-        fp_plus5 = self.alloc_scratch("fp_plus5", 1)
-        fp_plus6 = self.alloc_scratch("fp_plus6", 1)
-        c1_fp = self.scratch_const(1)
-        c2_fp = self.scratch_const(2)
-        # Flush c1, c2 together → {load: [const(1), const(2)]}
-        self._flush_consts()
-        # c3 is a new const; c4/c5/c6 already flushed in header section above.
-        c3_fp = self.scratch_const(3)
-        c4_fp = self.scratch_const(4)   # reuses header-flushed const
-        c5_fp = self.scratch_const(5)   # reuses header-flushed const
-        c6_fp = self.scratch_const(6)   # reuses header-flushed const
-        # Combine c3 flush with ALU fp+1,fp+2 (independent: fp+1,fp+2 use c1,c2 not c3).
-        # This merges two operations into one cycle via VLIW load+ALU parallelism.
-        assert len(self._pending_consts) == 1, "expected only const(3) pending"
-        c3_flush_op = self._pending_consts.pop(0)
-        self._pending_consts = []
-        # Cycle A: load const(3) [load slot] + compute fp+1, fp+2 [ALU slots]
-        self.instrs.append({
-            "load": [c3_flush_op],
-            "alu": [
-                ("+", fp_plus1, self.scratch["forest_values_p"], c1_fp),
-                ("+", fp_plus2, self.scratch["forest_values_p"], c2_fp),
-            ]
-        })
-        # Cycle B: load nv1, nv2 + compute fp+3..6 (c3 ready from A; fp+1,fp+2 from A)
-        self.instrs.append({
-            "load": [("load", nv1_scalar, fp_plus1), ("load", nv2_scalar, fp_plus2)],
-            "alu": [
-                ("+", fp_plus3, self.scratch["forest_values_p"], c3_fp),
-                ("+", fp_plus4, self.scratch["forest_values_p"], c4_fp),
-                ("+", fp_plus5, self.scratch["forest_values_p"], c5_fp),
-                ("+", fp_plus6, self.scratch["forest_values_p"], c6_fp),
-            ]
-        })
-        # Cycle C: load nv3, nv4 + compute delta = nv2 - nv1 (fp+3,4 from B; nv1,2 from B)
-        self.instrs.append({
-            "load": [("load", nv3_scalar, fp_plus3), ("load", nv4_scalar, fp_plus4)],
-            "alu": [("-", nv_delta_scalar, nv2_scalar, nv1_scalar)]
-        })
-        # Cycle D: load nv5, nv6 + compute base = nv1 - delta (fp+5,6 from B; delta from C)
-        self.instrs.append({
-            "load": [("load", nv5_scalar, fp_plus5), ("load", nv6_scalar, fp_plus6)],
-            "alu": [("-", nv_base_scalar, nv1_scalar, nv_delta_scalar)]
-        })
 
         # ── Scalar constants ──────────────────────────────────────────────────
         c0 = self.scratch_const(0, "c0")
@@ -566,27 +862,11 @@ class KernelBuilder:
         self._flush_consts()
 
         # Pack all vbroadcast ops (up to 6 per instruction using 6 valu slots).
-        # Includes nv_A initialization: all inputs start at gi=0, so all groups need
-        # forest_values[0] (already in nv_root_scalar). Replaces the 13-cycle round-0 prologue.
         all_broadcasts = [
             ("vbroadcast", v_one,    c1),
             ("vbroadcast", v_two,    c2),
             ("vbroadcast", v_nnodes, c_nn),
             ("vbroadcast", v_fp,     self.scratch["forest_values_p"]),
-            # nv_A for 3 groups: broadcast forest_values[0] to all 24 lanes
-            ("vbroadcast", self.nv_A,             nv_root_scalar),
-            ("vbroadcast", self.nv_A + VLEN,      nv_root_scalar),
-            ("vbroadcast", self.nv_A + 2 * VLEN,  nv_root_scalar),
-            ("vbroadcast", self.nv_A + 3 * VLEN,  nv_root_scalar),
-            # Spec 04 FR1: software nv constants for rounds with gi ∈ {1,2}
-            ("vbroadcast", v_nv_delta, nv_delta_scalar),
-            ("vbroadcast", v_nv_base,  nv_base_scalar),
-            # Spec 04 level-2: software nv constants for rounds with gi ∈ {3..6}
-            ("vbroadcast", v_nv3,  nv3_scalar),
-            ("vbroadcast", v_nv4,  nv4_scalar),
-            ("vbroadcast", v_nv5,  nv5_scalar),
-            ("vbroadcast", v_nv6,  nv6_scalar),
-            ("vbroadcast", v_five, self.scratch_const(5)),
         ] + [
             ("vbroadcast", hvc[val], self.const_map[val])
             for val in hvc
@@ -736,1005 +1016,52 @@ class KernelBuilder:
 
         self.add("flow", ("pause",))
 
-        # ── Main loop (unrolled: rounds x quadruplets of groups) ─────────────
-        # Spec 01: 3-group interleaved VALU hash pipeline (A/B/C).
-        # Spec 02: load/compute overlap with double-buffered nv_A/nv_B.
-        # Spec 03: packed multi-group navigation + vselect→multiply + xor overlap.
-        # Spec 05: 4th group (D) handled via ALU hash pipeline in parallel.
-        tmp1_slots = [self.tmp1_A, self.tmp1_B, self.tmp1_C]
-        tmp2_slots = [self.tmp2_A, self.tmp2_B, self.tmp2_C]
-        # Per-group nav temps: index into these by position within triplet (0,1,2)
-        tmp_nav_slots = [tmp_nav_A, tmp_nav_B, tmp_nav_C]
-        tmp_vld_slots = [tmp_vld_A, tmp_vld_B, tmp_vld_C]
-        n_quadruplets = n_groups // 4  # = 8 for n_groups=32
-        nv_bufs = [self.nv_A, self.nv_B]
+        # ── Spec 06: DAG-based multi-context scheduler ────────────────────────
+        # Replace hand-scheduled quadruplet loop with greedy list scheduler.
+        # group_size=16: 16 contexts × 48 words = 768 words; dag_base ~697, 697+768=1465 ≤ 1536.
+        group_size = 16
+        dag_base_offset = self.scratch_ptr
+        assert dag_base_offset + group_size * ScratchLayout.WORDS_PER_CTX <= SCRATCH_SIZE, (
+            f"DAG scratch overflow: need {dag_base_offset + group_size * ScratchLayout.WORDS_PER_CTX}, "
+            f"have {SCRATCH_SIZE}. Reduce group_size."
+        )
+        self.scratch_ptr += group_size * ScratchLayout.WORDS_PER_CTX
 
-        first_groups = [g for g in [0, 1, 2] if g < n_groups]
+        passes = [
+            list(range(i, min(i + group_size, n_groups)))
+            for i in range(0, n_groups, group_size)
+        ]
 
-        # Cross-round deferred nav-D/E: carry prev_nav_d_bounds and prev_nav_e across rounds.
-        # For non-last rounds, qi=7's nav-D and nav-E are deferred into round r+1's qi=0 hash.
-        prev_nav_d_bounds = []
-        # Spec 04: Flag to skip qi=0 xor if it was pre-applied by previous round's nav.
-        skip_ti0_xor = False
-        prev_nav_e = []
-
-        # Store slot limit per instruction bundle
-        STORE_LIMIT = SLOT_LIMITS["store"]  # 2
-
-        def inject_stores(bundle, pending):
-            """Add up to STORE_LIMIT store ops from pending to bundle. Modifies bundle in-place."""
-            if pending:
-                take = min(STORE_LIMIT, len(pending))
-                bundle["store"] = [pending.pop(0) for _ in range(take)]
-
-        for _r in range(rounds):
-            # In the last round: queue store ops after each triplet's hash completes.
-            # Stores use the STORE engine (independent from VALU/LOAD/ALU), so they can
-            # be added to any nav bundle without affecting other engines.
-            is_last_round = (_r == rounds - 1)
-            pending_stores = []  # list of ('vstore', addr_arr+g, val_base+g*VLEN) ops
-
-            # ── Spec 04: Round classification ─────────────────────────────────
-            # Classify each round to enable per-round-class optimizations.
-            is_level1_round = (_r == 1 or _r == rounds - 4)   # rounds 1, 12: gi ∈ {1,2}
-            is_root_round   = (_r == 0 or _r == 11)            # rounds 0, 11: gi=0
-            is_wrap_round   = (_r == rounds - 6)               # round 10: guaranteed all-wrap
-            is_level2_round = (_r == 2 or _r == rounds - 3)   # rounds 2, 13: gi ∈ {3..6}
-            # Determine if next round uses software nv (so we skip preloading in last triplet)
-            next_r = _r + 1
-            next_is_software_nv = (
-                next_r < rounds and
-                (next_r == 1 or next_r == rounds - 4 or next_r == 11
-                 or next_r == 2 or next_r == rounds - 3)
+        for pass_groups in passes:
+            n_ctx = len(pass_groups)
+            pass_layout = allocate_scratch(
+                n_contexts=n_ctx,
+                base_offset=dag_base_offset,  # reuse same scratch region each pass
+                val_base=val_base,
+                idx_base=idx_base,
+                group_ids=pass_groups,
             )
-
-            # ── Spec 04: nv_A for software_nv rounds was pre-filled by the
-            # previous round's last triplet hash (nv_fill_ops_for_hash). No
-            # standalone prologue cycle needed. ─────────────────────────────
-
-            # ── Main quadruplet loop ──────────────────────────────────────────
-            # nav-D bounds and nav-E of quadruplet qi are deferred into qi+1's hash
-            # even cycles (hi=0 and hi=1), saving 2 cycles per non-last quadruplet.
-            # For non-last rounds, qi=7's nav-D/E are deferred into the NEXT ROUND's
-            # qi=0 hash (cross-round deferred nav), saving 2 cycles per round.
-            # prev_nav_d_bounds and prev_nav_e are carried across round boundaries.
-
-            nv_preloaded_early = False  # set True at qi=n_quadruplets-2 when vi=6,7 of group 2 pre-loaded
-            for qi in range(n_quadruplets):
-                a, b, c = qi * 4, qi * 4 + 1, qi * 4 + 2
-                d_g = qi * 4 + 3  # group D index (handled by ALU hash)
-                groups = [a, b, c]  # A/B/C for VALU (always exactly 3 groups)
-                nv_cur      = nv_bufs[qi % 2]
-                nv_next_buf = nv_bufs[(qi + 1) % 2]
-                is_last = (qi == n_quadruplets - 1)
-
-                # Next quadruplet's groups (for addr_next and prefetch)
-                if not is_last:
-                    na, nb, nc = (qi + 1) * 4, (qi + 1) * 4 + 1, (qi + 1) * 4 + 2
-                    next_d_g = (qi + 1) * 4 + 3
-                    next_groups = [g for g in [na, nb, nc] if g < n_groups]
-                    next_d_g_in_bounds = next_d_g < n_groups
-                else:
-                    next_groups = []
-                    next_d_g = -1
-                    next_d_g_in_bounds = False
-
-                # Spec 04: For level1/root/level2 rounds, no scatter loads needed for nv.
-                # Instead, nv is computed via multiply_add (level1), vbroadcast (root),
-                # or FLOW vselect (level2).
-                software_nv_round = is_level1_round or is_root_round or is_level2_round
-                # Effective n_next_groups for scatter load purposes (A/B/C only = 3 groups)
-                # D's nv is handled separately via _d_nv_loads mechanism
-                scatter_n_next = 0 if software_nv_round else len(next_groups)
-
-                # Spec 04: Build nv_fill_ops and flow_schedule for next quadruplet
-                # (nv_fill_ops packed into hash free VALU slots; flow_schedule uses FLOW slots)
-                # Note: nv_fill only covers next A/B/C groups; D is handled separately via ALU
-                nv_fill_ops_for_hash = None
-                flow_schedule_for_hash = None
-                if software_nv_round and not is_last:
-                    # Within software_nv round: fill nv for next within-round quadruplet (A/B/C only).
-                    # D's nv fill is done as a standalone bundle in the group D nav section below.
-                    if is_level1_round:
-                        nv_fill_ops_for_hash = [
-                            ("multiply_add", nv_next_buf + j * VLEN,
-                             idx_base + ng * VLEN, v_nv_delta, v_nv_base)
-                            for j, ng in enumerate(next_groups)
-                        ]
-                    elif is_root_round:
-                        nv_fill_ops_for_hash = [
-                            ("vbroadcast", nv_next_buf + j * VLEN, nv_root_scalar)
-                            for j in range(len(next_groups))
-                        ]
-                    elif is_level2_round:
-                        # Level-2: mask_B (gi & 1) as nv_fill VALU; FLOW vselect for nv_lo/hi/final
-                        n_ng = len(next_groups)
-                        nv_fill_ops_for_hash = [
-                            ("&", mask_B_bufs[j], idx_base + ng * VLEN, v_one)
-                            for j, ng in enumerate(next_groups)
-                        ]
-                        # FLOW schedule: 9 ops across 9 hash cycles
-                        # mask_A for next_groups pre-computed (in xor_bundle or prev nav-A)
-                        # nv_fill (mask_B) packed into cycle 5 (4th free VALU slot)
-                        flow_schedule_for_hash = [None] * 9
-                        for j in range(n_ng):
-                            flow_schedule_for_hash[j * 2]     = ("vselect", nv_lo_bufs[j], mask_A_bufs[j], v_nv3, v_nv5)
-                            flow_schedule_for_hash[j * 2 + 1] = ("vselect", nv_hi_bufs[j], mask_A_bufs[j], v_nv4, v_nv6)
-                        for j in range(n_ng):
-                            flow_schedule_for_hash[6 + j] = ("vselect", nv_next_buf + j * VLEN, mask_B_bufs[j], nv_lo_bufs[j], nv_hi_bufs[j])
-                elif is_last and next_is_software_nv:
-                    # Last quadruplet of round before software_nv round:
-                    # Pre-fill nv_A for next round's first quadruplet (A/B/C; D handled by ALU path).
-                    if next_r == 11:  # next round is root
-                        nv_fill_ops_for_hash = [
-                            ("vbroadcast", self.nv_A + i * VLEN, nv_root_scalar)
-                            for i in range(len(first_groups))
-                        ]
-                    elif next_r == 1 or next_r == rounds - 4:  # next round is level1
-                        nv_fill_ops_for_hash = [
-                            ("multiply_add", self.nv_A + i * VLEN,
-                             idx_base + g * VLEN, v_nv_delta, v_nv_base)
-                            for i, g in enumerate(first_groups)
-                        ]
-                    elif next_r == 2 or next_r == rounds - 3:  # next round is level2
-                        # mask_A for first_groups was pre-computed in nav-A of qi=n_quadruplets-2
-                        n_fg = len(first_groups)
-                        nv_fill_ops_for_hash = [
-                            ("&", mask_B_bufs[j], idx_base + g * VLEN, v_one)
-                            for j, g in enumerate(first_groups)
-                        ]
-                        flow_schedule_for_hash = [None] * 9
-                        for j in range(n_fg):
-                            flow_schedule_for_hash[j * 2]     = ("vselect", nv_lo_bufs[j], mask_A_bufs[j], v_nv3, v_nv5)
-                            flow_schedule_for_hash[j * 2 + 1] = ("vselect", nv_hi_bufs[j], mask_A_bufs[j], v_nv4, v_nv6)
-                        for j in range(n_fg):
-                            flow_schedule_for_hash[6 + j] = ("vselect", self.nv_A + j * VLEN, mask_B_bufs[j], nv_lo_bufs[j], nv_hi_bufs[j])
-
-                # FR3: XOR bundle handling.
-                # qi=0: standalone xor(qi=0) + addr_next(qi=1).
-                # qi>=1: xor folded into nav-C of qi-1. No standalone bundle.
-                # Spec 04: skip qi=0 xor if pre-applied by previous round's nav.
-                if qi == 0:
-                    if skip_ti0_xor:
-                        # XOR, addr_next, and mask_A were already applied by previous round's
-                        # qi=7 nav-A/nav-B (fold optimization). Skip this entire bundle.
-                        skip_ti0_xor = False
-                    else:
-                        # XOR A/B/C groups via VALU; XOR group D and addr_next_D via ALU
-                        xor_ops = [
-                            ("^", val_base + g * VLEN, val_base + g * VLEN,
-                             nv_cur + i * VLEN)
-                            for i, g in enumerate(groups)
-                        ]
-                        # Group D XOR via ALU (8 scalar ops, one per lane)
-                        xor_d_alu_ops = [
-                            ("^", val_base + d_g * VLEN + lane, val_base + d_g * VLEN + lane, nv_cur + 3 * VLEN + lane)
-                            for lane in range(VLEN)
-                        ]
-                        # Spec 04: skip addr_next for software nv rounds (no scatter loads)
-                        if software_nv_round:
-                            addr_ops = []
-                            addr_d_alu_ops = []
-                        else:
-                            addr_ops = [
-                                ("+", self.addr_next + j * VLEN, v_fp,
-                                 idx_base + ng * VLEN)
-                                for j, ng in enumerate(next_groups)
-                            ]
-                            # Group D addr_next will be computed as VALU in nav_a (all 8 lanes).
-                            # The old ALU approach only set lane 0; VALU is required for correctness.
-                            addr_d_alu_ops = []
-                        # Spec 04 level-2: pre-compute mask_A for next_groups before hash.
-                        # xor bundle has 3 free VALU slots (software_nv_round → addr_ops=[]).
-                        mask_A_pre = []
-                        if is_level2_round and next_groups:
-                            mask_A_pre = [
-                                ("<", mask_A_bufs[j], idx_base + ng * VLEN, v_five)
-                                for j, ng in enumerate(next_groups)
-                            ]
-                            # D's mask_A (for level2) also via VALU (if room)
-                            if next_d_g_in_bounds and len(xor_ops + addr_ops + mask_A_pre) + 1 <= SLOT_LIMITS["valu"]:
-                                mask_A_pre = mask_A_pre + [("<", mask_A_bufs[3], idx_base + next_d_g * VLEN, v_five)]
-                        xor_bundle_valu = xor_ops + addr_ops + mask_A_pre
-                        # Combine all ALU ops for xor_bundle
-                        xor_bundle_alu = xor_d_alu_ops + addr_d_alu_ops
-                        assert len(xor_bundle_valu) <= SLOT_LIMITS["valu"], f"xor_bundle VALU overflow: {len(xor_bundle_valu)} ops"
-                        assert len(xor_bundle_alu) <= SLOT_LIMITS["alu"], f"xor_bundle ALU overflow: {len(xor_bundle_alu)} ops"
-                        # Optimization: merge xor bundle into preceding flow-only bundle (e.g., pause).
-                        # The flow engine is independent of valu; the pause is a no-op with enable_pause=False.
-                        # This saves 1 cycle at the setup→main-loop boundary (round 0 qi=0 xor).
-                        xor_bundle_dict = {"valu": xor_bundle_valu}
-                        if xor_bundle_alu:
-                            xor_bundle_dict["alu"] = xor_bundle_alu
-                        if (self.instrs and list(self.instrs[-1].keys()) == ["flow"]
-                                and not xor_bundle_alu
-                                and len(xor_bundle_valu) <= SLOT_LIMITS["valu"]):
-                            self.instrs[-1]["valu"] = xor_bundle_valu
-                        else:
-                            self.instrs.append(xor_bundle_dict)
-
-                gi_list  = [idx_base + g * VLEN for g in groups]
-                gv_list  = [val_base + g * VLEN for g in groups]
-                tn_list  = [tmp_nav_slots[i] for i in range(len(groups))]
-                tvld_list = [tmp_vld_slots[i] for i in range(len(groups))]
-
-                # gi-doubler: compute gi = 2*gi + 1 for current quadruplet's A/B/C groups.
-                # Packed into a free valu cycle within the hash (3rd available slot after nav_d/nav_e).
-                # Group D's gi_doubler is emitted separately in the nav section (avoids 4+3=7>6 overflow).
-                # Spec 04 FR4: Skip gi_doubler in the last round (gi_next never used).
-                # Spec 04 FR3: Skip gi_doubler in wrap round (gi set directly to 0 in nav-A).
-                if is_last_round or is_wrap_round:
-                    gi_doubler_ops = None
-                    gi_doubler_d_op = None
-                else:
-                    gi_doubler_ops = [
-                        ("multiply_add", gi_list[i], gi_list[i], v_two, v_one)
-                        for i in range(len(groups))
-                    ]
-                    # Group D's gi_doubler: emitted as standalone in nav section
-                    gi_doubler_d_op = ("multiply_add", idx_base + d_g * VLEN, idx_base + d_g * VLEN, v_two, v_one)
-
-                # Hash emission: pass deferred nav-D/E from PRIOR quadruplet to pack in even cycles,
-                # and gi_doubler_ops for CURRENT quadruplet's groups.
-                group_addrs = [
-                    (val_base + g * VLEN, tmp1_slots[i], tmp2_slots[i])
-                    for i, g in enumerate(groups)
-                ]
-                hash_start = len(self.instrs)  # record start for ALU overlay
-                extra_loads = []
-                if is_last:
-                    # For non-last rounds: preload nv_A for round r+1's triplet 0.
-                    # Spec 04: Skip preload if next round uses software nv (level1/root).
-                    preload_n = len(first_groups) if (_r < rounds - 1 and not next_is_software_nv) else 0
-                    # 2 loads (vi=6,7 of group 2) were pre-emitted in ti=n_triplets-2's nav-B.
-                    _preloaded = 2 if nv_preloaded_early else 0
-                    nv_preloaded_early = False
-                    if prev_nav_d_bounds or prev_nav_e or preload_n > 0 or nv_fill_ops_for_hash or flow_schedule_for_hash:
-                        extra_loads = self.emit_triplet_hash_with_prefetch_and_nav_tail(
-                            group_addrs, self.nv_A, self.addr_next, preload_n,
-                            prev_nav_d_bounds, prev_nav_e, gi_doubler_ops,
-                            nv_fill_ops=nv_fill_ops_for_hash,
-                            flow_schedule=flow_schedule_for_hash,
-                            preloaded_loads=_preloaded
-                        )
-                    else:
-                        self.emit_triplet_hash(group_addrs, gi_doubler_ops,
-                                               nv_fill_ops=nv_fill_ops_for_hash,
-                                               flow_schedule=flow_schedule_for_hash)
-                else:
-                    extra_loads = self.emit_triplet_hash_with_prefetch_and_nav_tail(
-                        group_addrs, nv_next_buf, self.addr_next, scatter_n_next,
-                        prev_nav_d_bounds, prev_nav_e, gi_doubler_ops,
-                        nv_fill_ops=nv_fill_ops_for_hash,
-                        flow_schedule=flow_schedule_for_hash
-                    )
-
-                # ── Spec 05: Group D ALU hash ──────────────────────────────────
-                # Compute 15 cycles of ALU ops for group D's hash.
-                # Inject ops[0..8] into hash cycles (fully parallel with VALU hash).
-                # ops[9..14] (6 remaining) stored for emission after nav.
-                alu_d_ops = self._emit_alu_hash_stages(
-                    (val_base + d_g * VLEN, self.tmp1_D, self.tmp2_D)
-                )
-                # Inject into already-emitted hash cycles
-                hash_end_pc = len(self.instrs)
-                n_hash_cycles_emitted = hash_end_pc - hash_start
-                for i in range(min(n_hash_cycles_emitted, len(alu_d_ops))):
-                    bundle = self.instrs[hash_start + i]
-                    if "alu" not in bundle:
-                        bundle["alu"] = alu_d_ops[i]
-                # Store remaining ALU ops for emission after nav
-                _remaining_alu_d = alu_d_ops[n_hash_cycles_emitted:]
-
-                # In the last round: enqueue store ops for current quadruplet's groups.
-                # A/B/C stores: finalized after VALU hash; inject early.
-                # D store: finalized only after ALL 15 ALU hash cycles complete; inject late.
-                if is_last_round:
-                    for g in groups:
-                        pending_stores.append(("vstore", addr_arr + g, val_base + g * VLEN))
-                    # D store is added AFTER remaining ALU ops are emitted (see below)
-
-                # ── Spec 04 FR4: Last round nav skip ──────────────────────────
-                # In the last round, gi_next is never used. Replace full nav with
-                # minimal cycles: just emit extra loads, xor, and addr_next2.
-                # Must respect load ordering: extra loads complete BEFORE xor reads nv_next_buf.
-                if is_last_round:
-                    has_overflow_lr = len(extra_loads) >= 3 and not is_last
-                    n_xor_in_lr = len(next_groups)
-                    deferred_xor_lr = None
-                    if has_overflow_lr:
-                        n_xor_in_lr = len(next_groups) - 1
-                        deferred_xor_lr = (len(next_groups) - 1, next_groups[-1])
-
-                    # Cycle 1: extra_loads[0] (if any) + stores
-                    # (replaces nav-A; skip gi & v_one computation)
-                    if len(extra_loads) > 0 or pending_stores:
-                        c1_bundle = {}
-                        if len(extra_loads) > 0:
-                            c1_bundle["load"] = extra_loads[0]
-                        inject_stores(c1_bundle, pending_stores)
-                        if c1_bundle:
-                            self.instrs.append(c1_bundle)
-
-                    if has_overflow_lr:
-                        # Cycle 2: xor for first n_xor_in_lr groups + extra_loads[1] + stores
-                        c2_valu = []
-                        if n_xor_in_lr > 0:
-                            c2_valu = [
-                                ("^", val_base + ng * VLEN, val_base + ng * VLEN,
-                                 nv_next_buf + j * VLEN)
-                                for j, ng in enumerate(next_groups[:n_xor_in_lr])
-                            ]
-                        c2_bundle = {"valu": c2_valu} if c2_valu else {}
-                        if len(extra_loads) > 1:
-                            c2_bundle["load"] = extra_loads[1]
-                        inject_stores(c2_bundle, pending_stores)
-                        if c2_bundle:
-                            self.instrs.append(c2_bundle)
-
-                        # For non-software_nv overflow: load nv_next_buf[3] for group D BEFORE
-                        # addr_next2 (Cycle 3) overwrites addr_next[3].
-                        if not is_last and next_d_g_in_bounds and not software_nv_round:
-                            # First, set addr_next[3] = v_fp + idx[next_d_g] (all 8 lanes via VALU).
-                            # addr_next[3] was last set by the prologue (pointing to idx[3] for the
-                            # next-round's qi=0 D), so we must recompute it for next_d_g here.
-                            addr_d_lr_of_bundle = {"valu": [("+", self.addr_next + 3 * VLEN, v_fp, idx_base + next_d_g * VLEN)]}
-                            inject_stores(addr_d_lr_of_bundle, pending_stores)
-                            self.instrs.append(addr_d_lr_of_bundle)
-                            nv_d_next_base_of = nv_next_buf + 3 * VLEN
-                            addr_d_next_of = self.addr_next + 3 * VLEN
-                            for vi in range(0, VLEN, 2):
-                                ld_b = {"load": [
-                                    ("load_offset", nv_d_next_base_of, addr_d_next_of, vi),
-                                    ("load_offset", nv_d_next_base_of, addr_d_next_of, vi + 1),
-                                ]}
-                                inject_stores(ld_b, pending_stores)
-                                self.instrs.append(ld_b)
-
-                        # Cycle 3: addr_next2 + extra_loads[2] + stores
-                        nn_a = (qi + 2) * 4
-                        next_next_groups = [g for g in [nn_a, nn_a+1, nn_a+2, nn_a+3] if g < n_groups]
-                        c3_valu = []
-                        if next_next_groups:
-                            c3_valu = [
-                                ("+", self.addr_next + j * VLEN, v_fp,
-                                 idx_base + ng * VLEN)
-                                for j, ng in enumerate(next_next_groups)
-                            ]
-                        if c3_valu or len(extra_loads) > 2 or pending_stores:
-                            c3_bundle = {"valu": c3_valu} if c3_valu else {}
-                            if len(extra_loads) > 2:
-                                c3_bundle["load"] = extra_loads[2]
-                            inject_stores(c3_bundle, pending_stores)
-                            if c3_bundle:
-                                self.instrs.append(c3_bundle)
-                        # Cycle 4: deferred xor for last overflow group + stores
-                        if deferred_xor_lr is not None:
-                            j_def, ng_def = deferred_xor_lr
-                            dx_ops = [("^", val_base + ng_def * VLEN, val_base + ng_def * VLEN, nv_next_buf + j_def * VLEN)]
-                            # Also include D's XOR if in bounds
-                            if not is_last and next_d_g_in_bounds:
-                                dx_ops = dx_ops + [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]
-                            dx_bundle = {"valu": dx_ops}
-                            inject_stores(dx_bundle, pending_stores)
-                            self.instrs.append(dx_bundle)
-                        elif not is_last and next_d_g_in_bounds:
-                            # No deferred xor but still need D's XOR
-                            xor_d_bundle = {"valu": [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]}
-                            inject_stores(xor_d_bundle, pending_stores)
-                            self.instrs.append(xor_d_bundle)
-                    else:
-                        # No overflow: xor + extra_loads[1:] + addr_next2
-                        if not is_last and len(next_groups) > 0:
-                            xor_next_ops = [
-                                ("^", val_base + ng * VLEN, val_base + ng * VLEN,
-                                 nv_next_buf + j * VLEN)
-                                for j, ng in enumerate(next_groups)
-                            ]
-                            xor_bundle = {"valu": xor_next_ops}
-                            if len(extra_loads) > 1:
-                                xor_bundle["load"] = extra_loads[1]
-                            inject_stores(xor_bundle, pending_stores)
-                            self.instrs.append(xor_bundle)
-                        # Prepare nv_next_buf[3] for group D XOR
-                        if not is_last and next_d_g_in_bounds:
-                            if software_nv_round:
-                                # Compute nv via software
-                                if is_level1_round:
-                                    nv_d_fill_lr = [("multiply_add", nv_next_buf + 3 * VLEN, idx_base + next_d_g * VLEN, v_nv_delta, v_nv_base)]
-                                elif is_root_round:
-                                    nv_d_fill_lr = [("vbroadcast", nv_next_buf + 3 * VLEN, nv_root_scalar)]
-                                elif is_level2_round:
-                                    nv_d_fill_lr = [("&", mask_B_bufs[3], idx_base + next_d_g * VLEN, v_one)]
-                                else:
-                                    nv_d_fill_lr = []
-                                if nv_d_fill_lr:
-                                    fill_bundle = {"valu": nv_d_fill_lr}
-                                    inject_stores(fill_bundle, pending_stores)
-                                    self.instrs.append(fill_bundle)
-                                if is_level2_round:
-                                    # mask_A_bufs[3] may not have been set for next_d_g yet
-                                    # (xor_bundle only sets it if there's room; emit it here explicitly).
-                                    mask_a_lr_d_bundle = {"valu": [("<", mask_A_bufs[3], idx_base + next_d_g * VLEN, v_five)]}
-                                    inject_stores(mask_a_lr_d_bundle, pending_stores)
-                                    self.instrs.append(mask_a_lr_d_bundle)
-                                    for op in [
-                                        ("vselect", nv_lo_bufs[3], mask_A_bufs[3], v_nv3, v_nv5),
-                                        ("vselect", nv_hi_bufs[3], mask_A_bufs[3], v_nv4, v_nv6),
-                                        ("vselect", nv_next_buf + 3 * VLEN, mask_B_bufs[3], nv_lo_bufs[3], nv_hi_bufs[3]),
-                                    ]:
-                                        self.instrs.append({"flow": [op]})
-                            else:
-                                # Load nv from scatter.
-                                # First, set addr_next[3] = v_fp + idx[next_d_g] (all 8 lanes via VALU).
-                                # addr_next[3] was last set by the prologue (pointing to idx[3] for the
-                                # next-round's qi=0 D), so we must recompute it for next_d_g here.
-                                addr_d_lr_bundle = {"valu": [("+", self.addr_next + 3 * VLEN, v_fp, idx_base + next_d_g * VLEN)]}
-                                inject_stores(addr_d_lr_bundle, pending_stores)
-                                self.instrs.append(addr_d_lr_bundle)
-                                nv_d_next_base_lr = nv_next_buf + 3 * VLEN
-                                addr_d_next_lr = self.addr_next + 3 * VLEN
-                                for vi in range(0, VLEN, 2):
-                                    ld_b = {"load": [
-                                        ("load_offset", nv_d_next_base_lr, addr_d_next_lr, vi),
-                                        ("load_offset", nv_d_next_base_lr, addr_d_next_lr, vi + 1),
-                                    ]}
-                                    inject_stores(ld_b, pending_stores)
-                                    self.instrs.append(ld_b)
-                        # XOR for group D (next_d_g) with nv_next_buf[3] — separate bundle
-                        if not is_last and next_d_g_in_bounds:
-                            xor_d_lr_bundle = {"valu": [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]}
-                            inject_stores(xor_d_lr_bundle, pending_stores)
-                            self.instrs.append(xor_d_lr_bundle)
-
-                        # Remaining extra loads
-                        for el in extra_loads[2:]:
-                            el_bundle = {"load": el}
-                            inject_stores(el_bundle, pending_stores)
-                            self.instrs.append(el_bundle)
-
-                        # addr_next2
-                        if not is_last:
-                            nn_a = (qi + 2) * 4
-                            next_next_groups = [g for g in [nn_a, nn_a+1, nn_a+2, nn_a+3] if g < n_groups]
-                            if next_next_groups:
-                                addr_ops = [
-                                    ("+", self.addr_next + j * VLEN, v_fp,
-                                     idx_base + ng * VLEN)
-                                    for j, ng in enumerate(next_next_groups)
-                                ]
-                                addr_bundle = {"valu": addr_ops}
-                                inject_stores(addr_bundle, pending_stores)
-                                self.instrs.append(addr_bundle)
-                            elif pending_stores:
-                                st_bundle = {}
-                                inject_stores(st_bundle, pending_stores)
-                                if st_bundle:
-                                    self.instrs.append(st_bundle)
-
-                    # Emit remaining ALU ops for group D (last round: just run hash, no nav needed)
-                    for alu_cycle in _remaining_alu_d:
-                        alu_bundle = {"alu": alu_cycle}
-                        inject_stores(alu_bundle, pending_stores)
-                        self.instrs.append(alu_bundle)
-                    # Enqueue D store AFTER all remaining ALU cycles (val_D now final)
-                    pending_stores.append(("vstore", addr_arr + d_g, val_base + d_g * VLEN))
-
-                    # Drain remaining stores
-                    while pending_stores:
-                        st_bundle = {}
-                        inject_stores(st_bundle, pending_stores)
-                        if st_bundle:
-                            self.instrs.append(st_bundle)
-                        else:
-                            break
-
-                    # No nav-D/E deferred (last round)
-                    prev_nav_d_bounds = []
-                    prev_nav_e = []
-                    continue  # Skip normal nav (last round: nav not needed for A/B/C or D)
-
-                # ── Navigation (gi-doubler in hash) ──
-                # gi-doubler in hash computes gi = 2*old_gi + 1.
-                # For no-overflow cases (n_next≤2): navigation is 2 cycles (nav-A, nav-B).
-                # For overflow cases (n_next=3): navigation is 3 cycles (nav-A, nav-B, nav-C) +
-                #   addr_next2 (1 cycle), same structure as pre-gi-doubler but nav-B is lighter.
-                #
-                # Extra loads for n_next=3: split across nav-A (vi=2,3), nav-B (vi=4,5),
-                #   nav-C (vi=6,7). Deferred_xor for group j goes into addr_next2 (AFTER nav-C
-                #   so vi=6,7 are committed).
-                nav_start_pc = len(self.instrs)
-                has_overflow = len(extra_loads) >= 3 and not is_last
-
-                # For overflow cases: n_xor_in_nav_c deferred xor
-                n_xor_in_nav_c = len(next_groups)
-                deferred_xor_group = None
-                deferred_prologue_addr_j2_overflow = None  # deferred when overflow hazard present
-                if has_overflow:
-                    n_xor_in_nav_c = len(next_groups) - 1
-                    deferred_xor_group = (len(next_groups) - 1, next_groups[-1])
-
-                # nav-A: tmp_nav = gv & v_one (reads hash output, must be after hash)
-                # FR3 (wrap round): directly set gi=0 via vbroadcast instead of &v_one + nav-D/E.
-                # For qi=n_quadruplets-2 in non-last rounds: fold prologue addr_next computation.
-                if is_wrap_round:
-                    # FR3: all inputs wrap to gi=0; set directly, skip bounds check + multiply.
-                    nav_a_ops = [("vbroadcast", gi_list[i], c0) for i in range(len(groups))]
-                else:
-                    nav_a_ops = [("&", tn_list[i], gv_list[i], v_one) for i in range(len(groups))]
-                if qi == n_quadruplets - 2 and _r < rounds - 1:
-                    # Spec 04: skip prologue addr_next if next round uses software nv
-                    if not next_is_software_nv:
-                        prologue_addr_ops = [
-                            ("+", self.addr_next + j * VLEN, v_fp, idx_base + ng * VLEN)
-                            for j, ng in enumerate(first_groups)
-                        ]
-                        # Hazard: when overflow, extra_loads[0..2] read addr_next[2] (j=2) in
-                        # nav-B and nav-C. Writing addr_next[2] in nav-A would corrupt those loads.
-                        # Defer the j=2 prologue addr_next to after extra_loads[2] completes.
-                        if has_overflow and len(prologue_addr_ops) > 2:
-                            deferred_prologue_addr_j2_overflow = prologue_addr_ops[2]
-                            prologue_addr_ops = prologue_addr_ops[:2] + prologue_addr_ops[3:]
-                        nav_a_ops = nav_a_ops + prologue_addr_ops
-                    elif next_r == 2 or next_r == rounds - 3:
-                        # Spec 04 level-2: pre-compute mask_A for first_groups before last hash.
-                        # These free slots are available since prologue addr_next is skipped.
-                        nav_a_ops = nav_a_ops + [
-                            ("<", mask_A_bufs[j], idx_base + g * VLEN, v_five)
-                            for j, g in enumerate(first_groups)
-                        ]
-                # Spec 04 level-2: pre-compute mask_A for qi+2's groups (= qi+1's next_groups)
-                # in qi's nav-A, so they're ready before qi+1's hash starts.
-                # (qi=0's xor bundle already handles mask_A for qi=0's next_groups.)
-                if is_level2_round and not is_last:
-                    nn_a_future = (qi + 2) * 4
-                    future_groups_l2 = [g for g in [nn_a_future, nn_a_future + 1, nn_a_future + 2] if g < n_groups]
-                    if future_groups_l2:
-                        nav_a_ops = nav_a_ops + [
-                            ("<", mask_A_bufs[j], idx_base + ng * VLEN, v_five)
-                            for j, ng in enumerate(future_groups_l2)
-                        ]
-                # Fold next round's qi=0 xor bundle: pre-compute addr_next or mask_A in nav-A.
-                # Applies only to qi=7 (is_last) of non-last rounds.
-                # This lets us skip the entire qi=0 xor bundle in the next round.
-                # IMPORTANT: Two hazards for addr_next slot j=2 (addr_next+16..23):
-                # 1. addr_next+16..23 must NOT be written in nav-A because extra_loads[1,2]
-                #    read addr_next+20..23 in nav-B and after; they must see OLD values.
-                # 2. The XOR for group 2 (val ^= nv_A[16..23]) must NOT happen until
-                #    nv_A[20..23] (lanes 4-7) are fully loaded. The loads happen in:
-                #    - nav_b (extra_loads[1] = vi=4,5 → nv_A[20,21])
-                #    - standalone (extra_loads[2] = vi=6,7 → nv_A[22,23])
-                #    So the XOR for group 2 must be deferred to AFTER extra_loads[2].
-                #    Groups 0 and 1 XOR can happen in nav-B (their nv fully loaded by then).
-                # Strategy:
-                # - nav-A: addr_next for j=0,1 only (groups 3,4)
-                # - nav-B: XOR for groups 0,1 only; extra_loads[1] in load slot
-                # - standalone extra_loads[2]: load nv_A[22,23]
-                # - deferred bundle: addr_next+16..23 for group 5 AND XOR for group 2
-                deferred_addr_next_j2 = None  # ("+", addr_next+2*VLEN, v_fp, idx_base+6*VLEN) if needed
-                deferred_xor_g2 = None        # ("^", val_base+2*VLEN, val_base+2*VLEN, nv_A+2*VLEN) if needed
-                deferred_xor_d = None         # ("^", val_base+3*VLEN, val_base+3*VLEN, nv_A+3*VLEN) if needed
-                if is_last and _r < rounds - 1:
-                    next_r_is_level2 = (next_r == 2 or next_r == rounds - 3)
-                    if not next_is_software_nv:
-                        # Pre-compute addr_next for next round's qi=1 groups [4,5] in nav-A (safe).
-                        # Also pre-compute addr_next[3] for next round's qi=0 D group (group 3).
-                        # Defer group 6 (j=2 → addr_next+16..23) to after all extra_loads complete,
-                        # to avoid overwriting addr_next+16..23 before extra_loads[1,2] use it.
-                        nav_a_ops = nav_a_ops + [
-                            ("+", self.addr_next + j * VLEN, v_fp, idx_base + ng * VLEN)
-                            for j, ng in enumerate([4, 5])   # only j=0,1
-                        ]
-                        # Add addr_next[3] = v_fp + idx[3] for next round's D group (group 3).
-                        # This uses the 6th free VALU slot in nav-A (3 nav + 2 addr + 1 D addr).
-                        nav_a_ops = nav_a_ops + [("+", self.addr_next + 3 * VLEN, v_fp, idx_base + 3 * VLEN)]
-                        deferred_addr_next_j2 = ("+", self.addr_next + 2 * VLEN, v_fp, idx_base + 6 * VLEN)
-                        # k=4: XOR fold disabled (skip_ti0_xor is not used for k=4).
-                        # Group D XOR cannot be pre-applied here (nv_A[3*VLEN] not yet loaded).
-                        # All XORs (A/B/C/D) happen in the next round's qi=0 xor_bundle.
-                        # deferred_xor_g2 = None  (already None, keep disabled)
-                        # (group 3 XOR will happen in next round's qi=0 xor_bundle instead)
-                    elif next_r_is_level2:
-                        # Pre-compute mask_A for next round's qi=0's next_groups [4,5,6]
-                        nav_a_ops = nav_a_ops + [
-                            ("<", mask_A_bufs[j], idx_base + ng * VLEN, v_five)
-                            for j, ng in enumerate([4, 5, 6])
-                        ]
-                # For non-last, non-software_nv rounds: compute addr_next[3] = v_fp + idx[next_d_g]
-                # as VALU op (vector, all 8 lanes). The ALU-based computation in the xor_bundle
-                # only sets lane 0; VALU is required to set all 8 lanes correctly.
-                addr_d_next_valu_op = None
-                if not is_last and not software_nv_round and next_d_g_in_bounds:
-                    addr_d_next_valu_op = ("+", self.addr_next + 3 * VLEN, v_fp, idx_base + next_d_g * VLEN)
-                    if len(nav_a_ops) < SLOT_LIMITS["valu"]:
-                        # Room in nav_a: fold in here
-                        nav_a_ops = nav_a_ops + [addr_d_next_valu_op]
-                        addr_d_next_valu_op = None  # consumed; no standalone needed
-                nav_a_bundle = {"valu": nav_a_ops}
-                if len(extra_loads) > 0:
-                    nav_a_bundle["load"] = extra_loads[0]
-                # For wrap round non-overflow: defer nav-A emission, will merge into nav-B.
-                if not (is_wrap_round and not has_overflow):
-                    inject_stores(nav_a_bundle, pending_stores)
-                    self.instrs.append(nav_a_bundle)
-
-                # Emit standalone addr_next[3] VALU op if it didn't fit in nav_a.
-                if addr_d_next_valu_op is not None:
-                    addr_d_bundle = {"valu": [addr_d_next_valu_op]}
-                    inject_stores(addr_d_bundle, pending_stores)
-                    self.instrs.append(addr_d_bundle)
-
-                if has_overflow:
-                    # 3-cycle nav (old nav-B style but gi already doubled):
-                    # nav-B: gi += tmp_nav + xor for first n_xor_in_nav_c groups
-                    # FR3: skip gi update (gi already set to 0 in nav-A via vbroadcast)
-                    nav_b_ops = [] if is_wrap_round else [("+", gi_list[i], gi_list[i], tn_list[i]) for i in range(len(groups))]
-                    if not is_last and n_xor_in_nav_c > 0:
-                        xor_next_ops = [
-                            ("^", val_base + ng * VLEN, val_base + ng * VLEN,
-                             nv_next_buf + j * VLEN)
-                            for j, ng in enumerate(next_groups[:n_xor_in_nav_c])
-                        ]
-                        nav_b_ops = nav_b_ops + xor_next_ops
-                    nav_b_bundle = {"valu": nav_b_ops}
-                    if len(extra_loads) > 1:
-                        nav_b_bundle["load"] = extra_loads[1]
-                    inject_stores(nav_b_bundle, pending_stores)
-                    self.instrs.append(nav_b_bundle)
-
-                    # Overflow: load nv for D of next quadruplet BEFORE nav-C overwrites addr_next[3].
-                    # addr_next[3] was set by xor_bundle ALU; nav_c addr_next2 will overwrite it.
-                    if not is_last and next_d_g_in_bounds and not software_nv_round:
-                        nv_d_next_base_of2 = nv_next_buf + 3 * VLEN
-                        addr_d_next_of2 = self.addr_next + 3 * VLEN
-                        for vi in range(0, VLEN, 2):
-                            ld_b2 = {"load": [
-                                ("load_offset", nv_d_next_base_of2, addr_d_next_of2, vi),
-                                ("load_offset", nv_d_next_base_of2, addr_d_next_of2, vi + 1),
-                            ]}
-                            inject_stores(ld_b2, pending_stores)
-                            self.instrs.append(ld_b2)
-
-                    # nav-C: addr_next2_ops in valu + extra_loads[2] in load slot
-                    nn_a = (qi + 2) * 4
-                    next_next_groups = [g for g in [nn_a, nn_a+1, nn_a+2, nn_a+3] if g < n_groups]
-                    nav_c_valu_ops = []
-                    # Spec 04: skip addr_next2 for software nv rounds
-                    if next_next_groups and not software_nv_round:
-                        nav_c_valu_ops = [
-                            ("+", self.addr_next + j * VLEN, v_fp,
-                             idx_base + ng * VLEN)
-                            for j, ng in enumerate(next_next_groups)
-                        ]
-                    nav_c_pc = len(self.instrs)  # record before appending (for 05b retroactive fold)
-                    if nav_c_valu_ops or len(extra_loads) > 2 or pending_stores:
-                        nav_c_bundle = {"valu": nav_c_valu_ops} if nav_c_valu_ops else {"valu": []}
-                        if len(extra_loads) > 2:
-                            nav_c_bundle["load"] = extra_loads[2]
-                        inject_stores(nav_c_bundle, pending_stores)
-                        if nav_c_bundle.get("valu") or nav_c_bundle.get("load") or nav_c_bundle.get("store"):
-                            self.instrs.append(nav_c_bundle)
-                        else:
-                            nav_c_pc = None  # bundle was not appended
-                    else:
-                        nav_c_pc = None  # bundle was not appended
-
-                    # addr_next2 = deferred_xor (now standalone, after vi=6,7 committed in nav-C)
-                    dx_pc = None  # record for 05b retroactive fold
-                    if deferred_xor_group is not None:
-                        j_def, ng_def = deferred_xor_group
-                        dx_valu = [
-                            ("^", val_base + ng_def * VLEN, val_base + ng_def * VLEN,
-                             nv_next_buf + j_def * VLEN)
-                        ]
-                        # Also emit the deferred prologue addr_next[2] here (safe: extra_loads[2]
-                        # committed in nav-C, so addr_next[2] no longer needed for scatter loads).
-                        if deferred_prologue_addr_j2_overflow is not None:
-                            dx_valu = dx_valu + [deferred_prologue_addr_j2_overflow]
-                            deferred_prologue_addr_j2_overflow = None
-                        dx_pc = len(self.instrs)  # record before appending
-                        dx_bundle = {"valu": dx_valu}
-                        inject_stores(dx_bundle, pending_stores)
-                        self.instrs.append(dx_bundle)
-                    elif deferred_prologue_addr_j2_overflow is not None:
-                        # No deferred_xor_group but still need to emit the deferred prologue addr
-                        dp_bundle = {"valu": [deferred_prologue_addr_j2_overflow]}
-                        deferred_prologue_addr_j2_overflow = None
-                        inject_stores(dp_bundle, pending_stores)
-                        self.instrs.append(dp_bundle)
-                else:
-                    # No overflow: nav-B (nav-A already emitted above, unless wrap merge)
-                    # FR3: skip gi update for wrap round (gi already set to 0 in nav-A)
-                    nav_b_ops = [] if is_wrap_round else [("+", gi_list[i], gi_list[i], tn_list[i]) for i in range(len(groups))]
-                    if not is_last and len(next_groups) > 0:
-                        xor_next_ops = [
-                            ("^", val_base + ng * VLEN, val_base + ng * VLEN,
-                             nv_next_buf + j * VLEN)
-                            for j, ng in enumerate(next_groups)
-                        ]
-                        nav_b_ops = nav_b_ops + xor_next_ops
-                    # k=4: XOR fold disabled. For k=3 this would pre-apply qi=0 XOR here
-                    # and set skip_ti0_xor=True to skip it in the next round. For k=4,
-                    # group D XOR cannot be pre-applied (nv_A[3] not yet available here),
-                    # so we skip the fold entirely and let qi=0 xor_bundle handle all groups.
-                    # For wrap round (non-overflow): merge deferred nav-A ops into nav-B if it fits.
-                    # If merging would exceed SLOT_LIMITS["valu"], emit nav-A separately first.
-                    extra_load_start = 0 if is_wrap_round else 1
-                    if is_wrap_round:
-                        if len(nav_a_ops) + len(nav_b_ops) <= SLOT_LIMITS["valu"]:
-                            nav_b_ops = nav_a_ops + nav_b_ops
-                        else:
-                            # Too many ops to merge: emit nav-A separately.
-                            na_bundle = {"valu": nav_a_ops}
-                            if len(extra_loads) > 0:
-                                na_bundle["load"] = extra_loads[0]
-                            inject_stores(na_bundle, pending_stores)
-                            self.instrs.append(na_bundle)
-                            # nav-B will use extra_loads[1] now that extra_loads[0] is consumed.
-                            extra_load_start = 1
-                    nav_b_bundle = {"valu": nav_b_ops}
-                    if len(extra_loads) > extra_load_start:
-                        nav_b_bundle["load"] = extra_loads[extra_load_start]
-                    # At qi=n_quadruplets-2: pre-load vi=6,7 of nv_A group 2 into nav-B's free
-                    # load slot. addr_next+2*VLEN was just computed in nav-A (prologue_addr_ops).
-                    # This eliminates the standalone load cycle at qi=n_quadruplets-1.
-                    elif (qi == n_quadruplets - 2 and _r < rounds - 1 and not next_is_software_nv):
-                        nav_b_bundle["load"] = [
-                            ("load_offset", self.nv_A + 2 * VLEN, self.addr_next + 2 * VLEN, 6),
-                            ("load_offset", self.nv_A + 2 * VLEN, self.addr_next + 2 * VLEN, 7),
-                        ]
-                        nv_preloaded_early = True
-                    inject_stores(nav_b_bundle, pending_stores)
-                    self.instrs.append(nav_b_bundle)
-
-                    # Emit any remaining extra_loads (e.g., from last-triplet preload overflow)
-                    for el in extra_loads[2:]:
-                        el_bundle = {"load": el}
-                        inject_stores(el_bundle, pending_stores)
-                        self.instrs.append(el_bundle)
-
-                    # Emit deferred bundle AFTER all extra_loads complete:
-                    # - addr_next+16..23 for group 5 (safe since extra_loads[1,2] done)
-                    # - XOR for group 2 (all of nv_A[16..23] now loaded)
-                    deferred_ops = []
-                    if deferred_addr_next_j2 is not None:
-                        deferred_ops.append(deferred_addr_next_j2)
-                    if deferred_xor_g2 is not None:
-                        deferred_ops.append(deferred_xor_g2)
-                    if deferred_ops:
-                        deferred_bundle = {"valu": deferred_ops}
-                        inject_stores(deferred_bundle, pending_stores)
-                        self.instrs.append(deferred_bundle)
-
-                    # For no-overflow non-last non-software_nv: load nv for D of next quadruplet
-                    # BEFORE addr_next2 overwrites addr_next[3].
-                    # addr_next[3] was set by xor_bundle ALU to v_fp + idx[next_d_g].
-                    # addr_next2 (below) will overwrite addr_next[3] with v_fp + idx[nn_d_g].
-                    if not is_last and next_d_g_in_bounds and not software_nv_round:
-                        nv_d_next_base_nof = nv_next_buf + 3 * VLEN
-                        addr_d_next_nof = self.addr_next + 3 * VLEN
-                        for vi in range(0, VLEN, 2):
-                            ld_b = {"load": [
-                                ("load_offset", nv_d_next_base_nof, addr_d_next_nof, vi),
-                                ("load_offset", nv_d_next_base_nof, addr_d_next_nof, vi + 1),
-                            ]}
-                            inject_stores(ld_b, pending_stores)
-                            self.instrs.append(ld_b)
-
-                    # For no-overflow non-last quadruplets: still need addr_next2 if next_next exists
-                    if not is_last:
-                        nn_a = (qi + 2) * 4
-                        next_next_groups = [g for g in [nn_a, nn_a+1, nn_a+2, nn_a+3] if g < n_groups]
-                        # Spec 04: skip addr_next2 for software nv rounds
-                        if next_next_groups and not software_nv_round:
-                            addr_ops = [
-                                ("+", self.addr_next + j * VLEN, v_fp,
-                                 idx_base + ng * VLEN)
-                                for j, ng in enumerate(next_next_groups)
-                            ]
-                            addr_bundle = {"valu": addr_ops}
-                            inject_stores(addr_bundle, pending_stores)
-                            self.instrs.append(addr_bundle)
-                        elif pending_stores:
-                            # No addr_next2 needed, but still have pending stores to inject
-                            st_bundle = {}
-                            inject_stores(st_bundle, pending_stores)
-                            if st_bundle:
-                                self.instrs.append(st_bundle)
-
-                # For last quadruplet of non-last non-software_nv round:
-                # load nv_A[3] for next round's qi=0 D group (group 3).
-                # addr_next[3] was set to v_fp + idx[3] in nav_a (above).
-                # addr_next2 is empty for is_last (qi=7), so addr_next[3] is still valid here.
-                if is_last and not is_last_round and not next_is_software_nv:
-                    nv_d_next_round_scatter_base = self.nv_A + 3 * VLEN
-                    addr_d_next_round = self.addr_next + 3 * VLEN
-                    for vi in range(0, VLEN, 2):
-                        ld_b_nr = {"load": [
-                            ("load_offset", nv_d_next_round_scatter_base, addr_d_next_round, vi),
-                            ("load_offset", nv_d_next_round_scatter_base, addr_d_next_round, vi + 1),
-                        ]}
-                        inject_stores(ld_b_nr, pending_stores)
-                        self.instrs.append(ld_b_nr)
-
-                # ── Group D: inject remaining ALU hash cycles into nav bundles ──
-                # Retroactively pack remaining ALU ops into already-emitted nav bundles
-                # (ALU slot is always empty in nav bundles — fully parallel execution).
-                # Mirrors the hash-phase injection pattern (hash_start above).
-                # For software_nv rounds: emit nv_d_fill + xor_d BEFORE nav_end_pc so
-                # the ALU injector sees them as injection targets (spec 05a).
-                if software_nv_round and not is_last and next_d_g_in_bounds:
-                    if is_level1_round:
-                        nv_d_fill = [("multiply_add", nv_next_buf + 3 * VLEN, idx_base + next_d_g * VLEN, v_nv_delta, v_nv_base)]
-                    elif is_root_round:
-                        nv_d_fill = [("vbroadcast", nv_next_buf + 3 * VLEN, nv_root_scalar)]
-                    elif is_level2_round:
-                        nv_d_fill = [("&", mask_B_bufs[3], idx_base + next_d_g * VLEN, v_one)]
-                    else:
-                        nv_d_fill = []
-                    if nv_d_fill:
-                        nv_d_bundle = {"valu": nv_d_fill}
-                        inject_stores(nv_d_bundle, pending_stores)
-                        self.instrs.append(nv_d_bundle)
-                    # For level2: also need FLOW vselect to get nv from nv_lo/hi
-                    if is_level2_round:
-                        # mask_A_bufs[3] may be stale (xor_bundle only adds it if room).
-                        # Explicitly compute it here (idx[next_d_g] < 5) before FLOW vselects.
-                        mask_a_svnv_d_bundle = {"valu": [("<", mask_A_bufs[3], idx_base + next_d_g * VLEN, v_five)]}
-                        inject_stores(mask_a_svnv_d_bundle, pending_stores)
-                        self.instrs.append(mask_a_svnv_d_bundle)
-                        # Emit FLOW cycles for D's nv computation
-                        flow_d_lo = {"flow": [("vselect", nv_lo_bufs[3], mask_A_bufs[3], v_nv3, v_nv5)]}
-                        self.instrs.append(flow_d_lo)
-                        flow_d_hi = {"flow": [("vselect", nv_hi_bufs[3], mask_A_bufs[3], v_nv4, v_nv6)]}
-                        self.instrs.append(flow_d_hi)
-                        flow_d_final = {"flow": [("vselect", nv_next_buf + 3 * VLEN, mask_B_bufs[3], nv_lo_bufs[3], nv_hi_bufs[3])]}
-                        self.instrs.append(flow_d_final)
-                    # XOR D_next with its software-computed nv
-                    xor_d_bundle = {"valu": [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]}
-                    inject_stores(xor_d_bundle, pending_stores)
-                    self.instrs.append(xor_d_bundle)
-                nav_end_pc = len(self.instrs)
-                n_nav_bundles = nav_end_pc - nav_start_pc
-                for i, alu_cycle in enumerate(_remaining_alu_d):
-                    if i < n_nav_bundles:
-                        bundle = self.instrs[nav_start_pc + i]
-                        if "alu" not in bundle:
-                            bundle["alu"] = alu_cycle
-                    else:
-                        alu_bundle = {"alu": alu_cycle}
-                        inject_stores(alu_bundle, pending_stores)
-                        self.instrs.append(alu_bundle)
-
-                # Spec 05b: D-nav injection — retroactively fold nav_a_d into nav-C and
-                # nav_b_d into deferred_xor for overflow scatter rounds, eliminating 2
-                # standalone cycles per quadruplet.
-                # Condition: has_overflow, not software_nv_round, not is_wrap_round,
-                # alu[5] (index 5) was injected into a nav bundle (requires n_nav_bundles >= 6),
-                # and nav-C/dx bundles were actually emitted.
-                nav_a_d_folded = False
-                nav_b_d_folded = False
-                if (has_overflow and not software_nv_round and not is_wrap_round
-                        and n_nav_bundles >= 6 and nav_c_pc is not None):
-                    alu5_abs_pc = nav_start_pc + 5  # alu[5] injected here
-                    # RAW check: nav-C must be >= 1 cycle after alu[5] (position 5 writes val_D;
-                    # spec requires reader at position >= 6; nav-C is at position 6 in practice)
-                    if nav_c_pc - alu5_abs_pc >= 1:
-                        nav_a_d_ops = [("&", tmp_nav_D, val_base + d_g * VLEN, v_one)]
-                        if gi_doubler_d_op is not None:
-                            nav_a_d_ops = nav_a_d_ops + [gi_doubler_d_op]
-                        nav_c_b = self.instrs[nav_c_pc]
-                        if len(nav_c_b.get("valu", [])) + len(nav_a_d_ops) <= SLOT_LIMITS["valu"]:
-                            nav_c_b["valu"] = nav_c_b.get("valu", []) + nav_a_d_ops
-                            nav_a_d_folded = True
-                            # nav_b_d: fold into deferred_xor (position nav_c_pc+1, gap=1 from nav_a_d — RAW safe)
-                            if dx_pc is not None:
-                                nav_b_d_ops = [("+", idx_base + d_g * VLEN, idx_base + d_g * VLEN, tmp_nav_D)]
-                                if not is_last and next_d_g_in_bounds and not software_nv_round:
-                                    nav_b_d_ops = nav_b_d_ops + [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]
-                                dx_b = self.instrs[dx_pc]
-                                if len(dx_b.get("valu", [])) + len(nav_b_d_ops) <= SLOT_LIMITS["valu"]:
-                                    dx_b["valu"] = dx_b.get("valu", []) + nav_b_d_ops
-                                    nav_b_d_folded = True
-
-                # Group D navigation: nav_a_D and nav_b_D
-                # In wrap round: set gi_D = 0 directly
-                # In normal rounds: nav_a_D = val_D & v_one; nav_b_D = gi_D += nav_a_D
-                # Spec 05b: skip standalone emission when folded into nav-C / deferred_xor.
-                if is_wrap_round:
-                    nav_a_d_bundle = {"valu": [("vbroadcast", idx_base + d_g * VLEN, c0)]}
-                    inject_stores(nav_a_d_bundle, pending_stores)
-                    self.instrs.append(nav_a_d_bundle)
-                    # XOR D_next with nv_D_next
-                    if not is_last and next_d_g_in_bounds and not software_nv_round:
-                        xor_d_bundle = {"valu": [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]}
-                        inject_stores(xor_d_bundle, pending_stores)
-                        self.instrs.append(xor_d_bundle)
-                else:
-                    if not nav_a_d_folded:
-                        # nav_a_D: tmp_nav_D = val_D & 1 (reads hashed val_D, writes tmp_nav_D)
-                        # gi_doubler_d (if active): gi_D = 2*gi_D + 1 (independent, safe to pack)
-                        nav_a_d_valu = [("&", tmp_nav_D, val_base + d_g * VLEN, v_one)]
-                        if gi_doubler_d_op is not None:
-                            nav_a_d_valu = nav_a_d_valu + [gi_doubler_d_op]
-                        nav_a_d_bundle = {"valu": nav_a_d_valu}
-                        inject_stores(nav_a_d_bundle, pending_stores)
-                        self.instrs.append(nav_a_d_bundle)
-                    if not nav_b_d_folded:
-                        nav_b_d_bundle = {"valu": [("+", idx_base + d_g * VLEN, idx_base + d_g * VLEN, tmp_nav_D)]}
-                        # XOR D_next with nv_D_next (if not software nv and not last)
-                        # nv_d_next_base is now fully loaded (4 load pairs above)
-                        if not is_last and next_d_g_in_bounds and not software_nv_round:
-                            nav_b_d_bundle["valu"] = nav_b_d_bundle["valu"] + [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]
-                        inject_stores(nav_b_d_bundle, pending_stores)
-                        self.instrs.append(nav_b_d_bundle)
-
-                # For last quadruplet of non-last round before a software_nv round:
-                # fill nv_A[3*VLEN] for next round's qi=0 group D.
-                # nv_fill_ops_for_hash only covers A/B/C (3 ops); D is handled here.
-                if is_last and not is_last_round and next_is_software_nv:
-                    # group 3 is the D group of qi=0 in the next round
-                    d_nv_next_round_group = 3  # = 0*4 + 3
-                    if next_r == 11:  # next round is root
-                        nv_d_next_round_fill = [("vbroadcast", self.nv_A + 3 * VLEN, nv_root_scalar)]
-                    elif next_r == 1 or next_r == rounds - 4:  # next round is level1
-                        nv_d_next_round_fill = [("multiply_add", self.nv_A + 3 * VLEN,
-                                                 idx_base + d_nv_next_round_group * VLEN,
-                                                 v_nv_delta, v_nv_base)]
-                    elif next_r == 2 or next_r == rounds - 3:  # next round is level2
-                        nv_d_next_round_fill = [("&", mask_B_bufs[3],
-                                                 idx_base + d_nv_next_round_group * VLEN, v_one)]
-                    else:
-                        nv_d_next_round_fill = []
-                    if nv_d_next_round_fill:
-                        nv_d_nr_bundle = {"valu": nv_d_next_round_fill}
-                        inject_stores(nv_d_nr_bundle, pending_stores)
-                        self.instrs.append(nv_d_nr_bundle)
-                    if (next_r == 2 or next_r == rounds - 3):  # level2 FLOW vselect for D
-                        # mask_A_bufs[3] must be computed here (not precomputed like A/B/C groups).
-                        # idx[g3] = gi for group 3, now finalized after nav_b_d.
-                        mask_a_d_bundle = {"valu": [("<", mask_A_bufs[3], idx_base + d_nv_next_round_group * VLEN, v_five)]}
-                        inject_stores(mask_a_d_bundle, pending_stores)
-                        self.instrs.append(mask_a_d_bundle)
-                        self.instrs.append({"flow": [("vselect", nv_lo_bufs[3], mask_A_bufs[3], v_nv3, v_nv5)]})
-                        self.instrs.append({"flow": [("vselect", nv_hi_bufs[3], mask_A_bufs[3], v_nv4, v_nv6)]})
-                        self.instrs.append({"flow": [("vselect", self.nv_A + 3 * VLEN, mask_B_bufs[3], nv_lo_bufs[3], nv_hi_bufs[3])]})
-
-                # nav-D bounds: deferred to hi=0 even of qi+1's hash
-                # FR3: gi=0 is already correct (all wrap); skip bounds check and multiply.
-                if is_wrap_round:
-                    curr_nav_d_bounds = []
-                    curr_nav_e = []
-                else:
-                    curr_nav_d_bounds = [
-                        ("<", tvld_list[i], gi_list[i], v_nnodes) for i in range(len(groups))
-                    ]
-                    # nav-E: deferred to hi=1 even of qi+1's hash
-                    curr_nav_e = [
-                        ("*", gi_list[i], gi_list[i], tvld_list[i]) for i in range(len(groups))
-                    ]
-
-                if is_last and _r == rounds - 1:
-                    # Last quadruplet of last round: idx is not checked by tests,
-                    # so skip nav-D/E (saves 2 cycles per kernel run).
-                    prev_nav_d_bounds = []
-                    prev_nav_e = []
-                elif is_last:
-                    # Last quadruplet but not last round: defer nav-D/E into next round's qi=0 hash.
-                    # Note: skip_ti0_xor optimization disabled for k=4 (group D XOR not pre-applied).
-                    prev_nav_d_bounds = curr_nav_d_bounds
-                    prev_nav_e = curr_nav_e
-                    # skip_ti0_xor = True  # Disabled for k=4: group D XOR needs xor_bundle
-                else:
-                    prev_nav_d_bounds = curr_nav_d_bounds
-                    prev_nav_e = curr_nav_e
+            ops = build_op_graph(
+                contexts=list(range(n_ctx)),
+                rounds=list(range(rounds)),
+                scratch=pass_layout,
+                hsc_new=self.hsc_new,
+                v_fp=v_fp,
+                v_one=v_one,
+                v_two=v_two,
+                v_nnodes=v_nnodes,
+            )
+            schedule = list_schedule(ops)
+            for bundle in schedule:
+                if not bundle.is_empty():
+                    self.instrs.append(bundle.to_instr_dict())
 
         # ── Store final val back to memory ─────────────────────────────────────
-        # Stores are injected into the last round's nav bundles above (inject_stores).
-        # Any remaining pending stores (if nav cycles weren't enough) go here.
-        # For the standard case (n_groups=32, 11 triplets, ~44 nav cycles), all 32 stores
-        # fit within nav cycles, so this loop emits nothing.
-        # addr_arr[g] = inp_values_p + g*VLEN (set during Phase 2a, never modified after).
+        STORE_LIMIT = SLOT_LIMITS["store"]
+        pending_stores = [
+            ("vstore", addr_arr + g, val_base + g * VLEN)
+            for g in range(n_groups)
+        ]
         while pending_stores:
             take = min(STORE_LIMIT, len(pending_stores))
             store_ops = [pending_stores.pop(0) for _ in range(take)]
