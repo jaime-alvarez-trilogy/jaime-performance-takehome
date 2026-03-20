@@ -126,7 +126,10 @@ class Bundle:
 
 
 def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nnodes,
-                   context_types=None, const_map=None):
+                   context_types=None, const_map=None,
+                   v_nv_root=None, v_nv_delta=None, v_nv_base=None,
+                   v_nv1=None, v_nv2=None, v_nv3=None, v_nv4=None,
+                   v_nv5=None, v_nv6=None):
     """
     Generate all Ops for a set of contexts/rounds with populated deps.
 
@@ -137,6 +140,11 @@ def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nno
     v_fp, v_one, v_two, v_nnodes: constant scratch addresses
     context_types: dict {ctx: 'valu_hash'|'alu_hash'} (Spec 07); None → all valu_hash
     const_map:     dict {raw_val: scalar_scratch_addr} for ALU hash scalar constants
+    v_nv_root:     scratch addr of broadcast vector node_val[0] (Spec 08; rounds 0,10,11)
+    v_nv_delta:    unused (kept for API compatibility)
+    v_nv_base:     unused (kept for API compatibility)
+    v_nv1..v_nv6:  scratch addrs of broadcast vectors node_val[1..6] (Spec 08)
+                   level2 uses gi&2 (v_two constant) for dispatch instead of v_five
     """
     if context_types is None:
         context_types = {}
@@ -163,56 +171,194 @@ def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nno
             # Stage counter per round
             s = 0
 
-            # ── Stage 0: addr_buf = v_fp + idx_buf ──────────────────────────
-            op_addr = Op(
-                engine='valu',
-                instr=('+', addr_buf, v_fp, idx_buf),
-                dst=addr_buf,
-                dep_srcs=[v_fp, idx_buf],
-                context_id=ctx, round_id=r, stage=s,
-            )
-            ctx_ops.append(op_addr)
-            s += 1
+            # ── Spec 08: determine round class ──────────────────────────────
+            rc = round_class(r)
 
-            # ── Stages 1–4: scatter load nv_buf (4 load pairs = 8 ops) ─────
-            # Each load_offset writes to nv_buf+vi (one word per op).
-            # Track individual words for accurate dep analysis.
-            load_ops_this_round = []
-            for vi in range(0, VLEN, 2):
-                op_ld0 = Op(
-                    engine='load',
-                    instr=('load_offset', nv_buf, addr_buf, vi),
-                    dst=nv_buf + vi,        # individual word destination
-                    dep_srcs=[addr_buf],    # reads the base address (all VLEN words)
+            # ── Stage 0: addr_buf = v_fp + idx_buf (scatter/last/wrap rounds) ──
+            # Non-scatter rounds don't need addr_buf (no scatter loads issued).
+            # wrap (10): still needs scatter load to read level-10 node values;
+            #   only the nav step is simplified (idx zeroed unconditionally).
+            if rc in ('scatter', 'last', 'wrap'):
+                op_addr = Op(
+                    engine='valu',
+                    instr=('+', addr_buf, v_fp, idx_buf),
+                    dst=addr_buf,
+                    dep_srcs=[v_fp, idx_buf],
                     context_id=ctx, round_id=r, stage=s,
                 )
-                op_ld1 = Op(
-                    engine='load',
-                    instr=('load_offset', nv_buf, addr_buf, vi + 1),
-                    dst=nv_buf + vi + 1,    # individual word destination
-                    dep_srcs=[addr_buf],
-                    context_id=ctx, round_id=r, stage=s,
-                )
-                ctx_ops.append(op_ld0)
-                ctx_ops.append(op_ld1)
-                load_ops_this_round.append(op_ld0)
-                load_ops_this_round.append(op_ld1)
+                ctx_ops.append(op_addr)
                 s += 1
 
-            # ── Stage 5: val_buf ^= nv_buf ──────────────────────────────────
-            # Reads all VLEN words of nv_buf — must wait for ALL 8 loads.
-            op_xor = Op(
-                engine='valu',
-                instr=('^', val_buf, val_buf, nv_buf),
-                dst=val_buf,
-                dep_srcs=[val_buf] + [nv_buf + vi for vi in range(VLEN)],
-                context_id=ctx, round_id=r, stage=s,
-            )
+            # ── Stages 1–4: nv source (class-dependent) ─────────────────────
+            # scatter/last/wrap: 8 scatter load_offset ops (4 pairs, VLEN=8 lanes)
+            # software_nv rounds 1,12: vselect(lo_bit, v_nv1, v_nv2)
+            # software_nv rounds 0,11: nv = v_nv_root (already broadcast); skip nv_buf write
+            # level2 (2,13): 3-level vselect using gi&1 and gi&2 bits
+            if rc in ('scatter', 'last', 'wrap'):
+                # Scatter load nv_buf (4 load pairs = 8 ops).
+                # Each load_offset writes to nv_buf+vi (one word per op).
+                for vi in range(0, VLEN, 2):
+                    op_ld0 = Op(
+                        engine='load',
+                        instr=('load_offset', nv_buf, addr_buf, vi),
+                        dst=nv_buf + vi,
+                        dep_srcs=[addr_buf],
+                        context_id=ctx, round_id=r, stage=s,
+                    )
+                    op_ld1 = Op(
+                        engine='load',
+                        instr=('load_offset', nv_buf, addr_buf, vi + 1),
+                        dst=nv_buf + vi + 1,
+                        dep_srcs=[addr_buf],
+                        context_id=ctx, round_id=r, stage=s,
+                    )
+                    ctx_ops.append(op_ld0)
+                    ctx_ops.append(op_ld1)
+                    s += 1
+            elif rc == 'software_nv' and r in (1, 12):
+                # gi ∈ {1, 2}: select between v_nv1 (gi=1, lo_bit=1) and v_nv2 (gi=2, lo_bit=0).
+                # Step 1: lo_bit = idx_buf & 1  (VALU, writes tmp_nav)
+                op_lo = Op(
+                    engine='valu',
+                    instr=('&', tmp_nav, idx_buf, v_one),
+                    dst=tmp_nav,
+                    dep_srcs=[idx_buf, v_one],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_lo)
+                s += 1
+                # Step 2: nv_buf = vselect(lo_bit, v_nv1, v_nv2)  (FLOW)
+                # lo=1 → gi=1 → nv1; lo=0 → gi=2 → nv2
+                op_nv = Op(
+                    engine='flow',
+                    instr=('vselect', nv_buf, tmp_nav, v_nv1, v_nv2),
+                    dst=nv_buf,
+                    dep_srcs=[tmp_nav, v_nv1, v_nv2],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_nv)
+                s += 1
+            elif rc == 'level2':
+                # gi ∈ {3, 4, 5, 6}: 2-bit dispatch using lo_bit (gi&1) and bit1 (gi&2).
+                # gi=3(011): lo=1, bit1=2(T) → nv3
+                # gi=4(100): lo=0, bit1=0(F) → nv4
+                # gi=5(101): lo=1, bit1=0(F) → nv5
+                # gi=6(110): lo=0, bit1=2(T) → nv6
+                # bit1 groups: {3,6} have bit1≠0; {4,5} have bit1=0
+                #
+                # Dispatch using v_two (broadcast(2), existing constant):
+                # If bit1≠0 and lo=1 → nv3; if bit1≠0 and lo=0 → nv6
+                # If bit1=0  and lo=1 → nv5; if bit1=0  and lo=0 → nv4
+                #
+                # Step 1: lo_bit = idx_buf & 1  →  tmp1   (VALU; keep tmp_nav free for step 4)
+                op_lo = Op(
+                    engine='valu',
+                    instr=('&', tmp1, idx_buf, v_one),
+                    dst=tmp1,
+                    dep_srcs=[idx_buf, v_one],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_lo)
+                s += 1
+                # Step 2: bit1 = idx_buf & 2  →  tmp_vld  (VALU; reuse v_two constant)
+                op_b1 = Op(
+                    engine='valu',
+                    instr=('&', tmp_vld, idx_buf, v_two),
+                    dst=tmp_vld,
+                    dep_srcs=[idx_buf, v_two],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_b1)
+                s += 1
+                # Step 3: nv_bit1_T = vselect(lo_bit, v_nv3, v_nv6)  →  nv_buf  (FLOW)
+                # When bit1≠0: lo=1→nv3, lo=0→nv6
+                op_nv_t = Op(
+                    engine='flow',
+                    instr=('vselect', nv_buf, tmp1, v_nv3, v_nv6),
+                    dst=nv_buf,
+                    dep_srcs=[tmp1, v_nv3, v_nv6],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_nv_t)
+                s += 1
+                # Step 4: nv_bit1_F = vselect(lo_bit, v_nv5, v_nv4)  →  tmp_nav  (FLOW)
+                # When bit1=0: lo=1→nv5, lo=0→nv4
+                op_nv_f = Op(
+                    engine='flow',
+                    instr=('vselect', tmp_nav, tmp1, v_nv5, v_nv4),
+                    dst=tmp_nav,
+                    dep_srcs=[tmp1, v_nv5, v_nv4],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_nv_f)
+                s += 1
+                # Step 5: nv_buf = vselect(bit1, nv_buf, tmp_nav)  →  nv_buf  (FLOW)
+                # bit1≠0 → use nv_buf (nv3 or nv6); bit1=0 → use tmp_nav (nv5 or nv4)
+                op_nv_sel = Op(
+                    engine='flow',
+                    instr=('vselect', nv_buf, tmp_vld, nv_buf, tmp_nav),
+                    dst=nv_buf,
+                    dep_srcs=[tmp_vld, nv_buf, tmp_nav],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_nv_sel)
+                s += 1
+            # software_nv rounds 0,11 and wrap round 10: nv = v_nv_root (constant vector),
+            # no nv_buf write — XOR op will reference v_nv_root directly.
+
+            # ── Stages 6–14: hash engine type ────────────────────────────────
+            is_alu_hash = context_types.get(ctx) == 'alu_hash'
+
+            # ── Stage 5: val_buf ^= nv ──────────────────────────────────────
+            # dep_srcs for val_buf side: for ALU-hash contexts, the previous round's
+            # hash wrote individual per-lane addresses (val_buf+i). The XOR must wait
+            # for ALL lanes to complete, so use [val_buf+vi for vi in range(VLEN)]
+            # rather than just [val_buf]. For VALU-hash, a single val_buf suffices
+            # because multiply_add writes the whole vector in one op.
+            if is_alu_hash:
+                val_dep_srcs = [val_buf + vi for vi in range(VLEN)]
+            else:
+                val_dep_srcs = [val_buf]
+
+            if rc in ('scatter', 'last', 'wrap'):
+                # Reads all VLEN words of nv_buf — must wait for ALL 8 loads.
+                # wrap (10): scatter-loaded nv_buf still needed (level-10 node values).
+                op_xor = Op(
+                    engine='valu',
+                    instr=('^', val_buf, val_buf, nv_buf),
+                    dst=val_buf,
+                    dep_srcs=val_dep_srcs + [nv_buf + vi for vi in range(VLEN)],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+            elif rc == 'software_nv' and r in (1, 12):
+                # nv_buf written by vselect op above (flow engine)
+                op_xor = Op(
+                    engine='valu',
+                    instr=('^', val_buf, val_buf, nv_buf),
+                    dst=val_buf,
+                    dep_srcs=val_dep_srcs + [nv_buf],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+            elif rc == 'software_nv':
+                # rounds 0, 11 (gi=0): nv = v_nv_root constant
+                op_xor = Op(
+                    engine='valu',
+                    instr=('^', val_buf, val_buf, v_nv_root),
+                    dst=val_buf,
+                    dep_srcs=val_dep_srcs + [v_nv_root],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+            else:
+                # level2 (rc == 'level2'): nv_buf written by final vselect (step 5)
+                op_xor = Op(
+                    engine='valu',
+                    instr=('^', val_buf, val_buf, nv_buf),
+                    dst=val_buf,
+                    dep_srcs=val_dep_srcs + [nv_buf],
+                    context_id=ctx, round_id=r, stage=s,
+                )
             ctx_ops.append(op_xor)
             s += 1
-
-            # ── Stages 6–14: hash ────────────────────────────────────────────
-            is_alu_hash = context_types.get(ctx) == 'alu_hash'
 
             if is_alu_hash:
                 # ── ALU hash: 15 sub-cycles × 8 lanes = 120 ALU ops per round ──
@@ -229,14 +375,22 @@ def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nno
                         c_C = const_map[val1]
                         # Sub-cycle 1: val_buf[i] = val_buf[i] * factor
                         for i in range(VLEN):
-                            # First sub-cycle ever: use whole-vector val_buf as dep_src
-                            # so last_writer[val_buf] (= the XOR op) is linked correctly.
-                            dep_src_val = val_buf if first_alu_hash_subcycle else (val_buf + i)
+                            # First sub-cycle ever: explicitly link all 8 lanes to op_xor.
+                            # val_buf = val_buf+0 so last_writer[val_buf] gets overwritten
+                            # by lane 0's write — lanes 1..7 must carry op_xor as an
+                            # explicit dep to avoid scheduling before the XOR completes.
+                            if first_alu_hash_subcycle:
+                                pre_deps = [op_xor]
+                                dep_srcs = [c_factor]
+                            else:
+                                pre_deps = []
+                                dep_srcs = [val_buf + i, c_factor]
                             op_am1 = Op(
                                 engine='alu',
                                 instr=('*', val_buf + i, val_buf + i, c_factor),
                                 dst=val_buf + i,
-                                dep_srcs=[dep_src_val, c_factor],
+                                dep_srcs=dep_srcs,
+                                deps=pre_deps,
                                 context_id=ctx, round_id=r, stage=s,
                             )
                             ctx_ops.append(op_am1)
@@ -337,74 +491,90 @@ def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nno
                         ctx_ops.append(op_h3)
                         s += 1
 
-            # ── Navigation (skip for last round) ────────────────────────────
-            # Navigation formula: idx_next = 2*idx + 1 + (val & 1)
+            # ── Navigation (class-dependent) ────────────────────────────────
+            # 'last' (round 15): skip all nav (idx never used after)
+            # 'wrap' (round 10): gi-clear only — set idx=0 (all children OOB → all wrap)
+            # 'scatter', 'software_nv', 'level2': full standard nav
             #   gi_double: idx = idx * 2 + 1  (via multiply_add(idx, idx, v_two, v_one))
             #   nav_a:     tmp_nav = val & 1  (low bit of hash output)
             #   nav_b:     idx += tmp_nav     (adds 0 or 1)
             #   nav_c:     tmp_vld = idx < n_nodes  (bounds check)
             #   nav_d:     idx *= tmp_vld     (wrap OOB to 0)
             if r != last_round:
-                # Gi-doubler: idx = idx * 2 + 1
-                op_gi_double = Op(
-                    engine='valu',
-                    instr=('multiply_add', idx_buf, idx_buf, v_two, v_one),
-                    dst=idx_buf,
-                    dep_srcs=[idx_buf, v_two, v_one],
-                    context_id=ctx, round_id=r, stage=s,
-                )
-                ctx_ops.append(op_gi_double)
-                s += 1
-
-                # Nav A: tmp_nav = val_buf & 1
-                # For ALU-hash contexts, val_buf was written per-lane (val_buf+i).
-                # Use per-lane dep_srcs so the dep builder finds the last ALU hash ops.
-                if is_alu_hash:
-                    nav_a_dep_srcs = [val_buf + i for i in range(VLEN)] + [v_one]
+                if rc == 'wrap':
+                    # All children of level-9 nodes are OOB → guaranteed all-wrap to gi=0.
+                    # Self-XOR clears idx_buf to 0 vector.
+                    op_gi_clear = Op(
+                        engine='valu',
+                        instr=('^', idx_buf, idx_buf, idx_buf),
+                        dst=idx_buf,
+                        dep_srcs=[idx_buf],
+                        context_id=ctx, round_id=r, stage=s,
+                    )
+                    ctx_ops.append(op_gi_clear)
+                    s += 1
                 else:
-                    nav_a_dep_srcs = [val_buf, v_one]
-                op_nav_a = Op(
-                    engine='valu',
-                    instr=('&', tmp_nav, val_buf, v_one),
-                    dst=tmp_nav,
-                    dep_srcs=nav_a_dep_srcs,
-                    context_id=ctx, round_id=r, stage=s,
-                )
-                ctx_ops.append(op_nav_a)
-                s += 1
+                    # Full standard nav: gi_double + nav A/B/C/D
+                    # Gi-doubler: idx = idx * 2 + 1
+                    op_gi_double = Op(
+                        engine='valu',
+                        instr=('multiply_add', idx_buf, idx_buf, v_two, v_one),
+                        dst=idx_buf,
+                        dep_srcs=[idx_buf, v_two, v_one],
+                        context_id=ctx, round_id=r, stage=s,
+                    )
+                    ctx_ops.append(op_gi_double)
+                    s += 1
 
-                # Nav B: idx_buf += tmp_nav
-                op_nav_b = Op(
-                    engine='valu',
-                    instr=('+', idx_buf, idx_buf, tmp_nav),
-                    dst=idx_buf,
-                    dep_srcs=[idx_buf, tmp_nav],
-                    context_id=ctx, round_id=r, stage=s,
-                )
-                ctx_ops.append(op_nav_b)
-                s += 1
+                    # Nav A: tmp_nav = val_buf & 1
+                    # For ALU-hash contexts, val_buf was written per-lane (val_buf+i).
+                    # Use per-lane dep_srcs so the dep builder finds the last ALU hash ops.
+                    if is_alu_hash:
+                        nav_a_dep_srcs = [val_buf + i for i in range(VLEN)] + [v_one]
+                    else:
+                        nav_a_dep_srcs = [val_buf, v_one]
+                    op_nav_a = Op(
+                        engine='valu',
+                        instr=('&', tmp_nav, val_buf, v_one),
+                        dst=tmp_nav,
+                        dep_srcs=nav_a_dep_srcs,
+                        context_id=ctx, round_id=r, stage=s,
+                    )
+                    ctx_ops.append(op_nav_a)
+                    s += 1
 
-                # Nav bounds: tmp_vld = idx_buf < v_nnodes
-                op_nav_c = Op(
-                    engine='valu',
-                    instr=('<', tmp_vld, idx_buf, v_nnodes),
-                    dst=tmp_vld,
-                    dep_srcs=[idx_buf, v_nnodes],
-                    context_id=ctx, round_id=r, stage=s,
-                )
-                ctx_ops.append(op_nav_c)
-                s += 1
+                    # Nav B: idx_buf += tmp_nav
+                    op_nav_b = Op(
+                        engine='valu',
+                        instr=('+', idx_buf, idx_buf, tmp_nav),
+                        dst=idx_buf,
+                        dep_srcs=[idx_buf, tmp_nav],
+                        context_id=ctx, round_id=r, stage=s,
+                    )
+                    ctx_ops.append(op_nav_b)
+                    s += 1
 
-                # Nav multiply: idx_buf *= tmp_vld (wraps OOB indices to 0)
-                op_nav_d = Op(
-                    engine='valu',
-                    instr=('*', idx_buf, idx_buf, tmp_vld),
-                    dst=idx_buf,
-                    dep_srcs=[idx_buf, tmp_vld],
-                    context_id=ctx, round_id=r, stage=s,
-                )
-                ctx_ops.append(op_nav_d)
-                s += 1
+                    # Nav bounds: tmp_vld = idx_buf < v_nnodes
+                    op_nav_c = Op(
+                        engine='valu',
+                        instr=('<', tmp_vld, idx_buf, v_nnodes),
+                        dst=tmp_vld,
+                        dep_srcs=[idx_buf, v_nnodes],
+                        context_id=ctx, round_id=r, stage=s,
+                    )
+                    ctx_ops.append(op_nav_c)
+                    s += 1
+
+                    # Nav multiply: idx_buf *= tmp_vld (wraps OOB indices to 0)
+                    op_nav_d = Op(
+                        engine='valu',
+                        instr=('*', idx_buf, idx_buf, tmp_vld),
+                        dst=idx_buf,
+                        dep_srcs=[idx_buf, tmp_vld],
+                        context_id=ctx, round_id=r, stage=s,
+                    )
+                    ctx_ops.append(op_nav_d)
+                    s += 1
 
         # ── Populate deps via last-writer analysis ───────────────────────────
         # Process ops in round/stage order; track last writer per scratch addr
@@ -534,7 +704,32 @@ def assign_context_types(contexts):
     return {ctx: ('alu_hash' if ctx % 4 == 3 else 'valu_hash') for ctx in contexts}
 
 
-# ── End Spec 07 / End Spec 06 DAG Infrastructure ─────────────────────────────
+# ── Spec 08: Depth Specialization atop DAG Scheduler ─────────────────────────
+
+
+def round_class(round_id: int) -> str:
+    """
+    Returns the class string for a given round_id in [0, 15].
+
+    Classes:
+      'software_nv' — rounds 0, 1, 11, 12: no scatter loads; nv via multiply_add or v_nv_root
+      'level2'      — rounds 2, 13:          no scatter loads; nv via multiply_add (same formula)
+      'wrap'        — round 10:              no scatter loads; all inputs wrap to gi=0
+      'last'        — round 15:              scatter loads; nav ops skipped (result unused)
+      'scatter'     — rounds 3–9, 14:        scatter loads + full nav
+    """
+    if round_id in (0, 1, 11, 12):
+        return 'software_nv'
+    if round_id in (2, 13):
+        return 'level2'
+    if round_id == 10:
+        return 'wrap'
+    if round_id == 15:
+        return 'last'
+    return 'scatter'
+
+
+# ── End Spec 08 / End Spec 07 / End Spec 06 DAG Infrastructure ────────────────
 
 
 class KernelBuilder:
@@ -1118,6 +1313,47 @@ class KernelBuilder:
             if bundle:
                 self.instrs.append(bundle)
 
+        # ── Spec 08: software_nv / level2 / wrap constant loading ────────────
+        # Preload node_val[0..6] from forest memory into scalar scratch, then
+        # broadcast each to a vector scratch slot.  These constants replace
+        # scatter loads in non-scatter rounds:
+        #   rounds 0,11 (gi=0):    nv = v_nv[0]
+        #   rounds 1,12 (gi=1,2):  nv = vselect(gi&1, v_nv[1], v_nv[2])
+        #   round 10 (wrap/gi=0):  nv = v_nv[0]
+        #   rounds 2,13 (gi=3..6): 2-level vselect using gi&1 and gi&2 bits
+        #                          (gi&2 reuses existing v_two constant)
+        #
+        # Scratch budget: 7 scalars + 7×VLEN = 7 + 56 = 63 words.
+        # node_val[i] address = forest_values_p + i.
+        # We reuse s_nv[1..6] as address buffers first, then overwrite with values.
+        # Step 1: add_imm(s_nv[i], fvp, i) → s_nv[i] = scratch[fvp] + i = fp+i
+        # Step 2: load(s_nv[i], s_nv[i])   → s_nv[i] = mem[fp+i] = node_val[i]
+        fvp = self.scratch["forest_values_p"]
+        s_nv = [self.alloc_scratch(f"s_nv{i}") for i in range(7)]   # 7 scalar slots
+        v_nv = [self.alloc_scratch(f"v_nv{i}", VLEN) for i in range(7)]  # 7 × VLEN = 56
+
+        # Step 1: compute forest_values_p + i into s_nv[1..6] via flow add_imm (1/cycle).
+        for i in range(1, 7):
+            self.instrs.append({"flow": [("add_imm", s_nv[i], fvp, i)]})
+
+        # Step 2: load node_val[0..6] from forest memory.
+        # node_val[0]: load(s_nv[0], fvp)      → mem[scratch[fvp]]      = mem[fp]
+        # node_val[i]: load(s_nv[i], s_nv[i])  → mem[scratch[s_nv[i]]]  = mem[fp+i]
+        # Self-referential load overwrites the address slot with the value. ✓
+        all_loads_nv = [("load", s_nv[0], fvp)] + [
+            ("load", s_nv[i], s_nv[i]) for i in range(1, 7)
+        ]
+        for i in range(0, len(all_loads_nv), 2):
+            self.instrs.append({"load": all_loads_nv[i:i + 2]})
+
+        # Step 3: broadcast node_val[0..6] to vector scratch (6 per VALU cycle).
+        all_vb_nv = [("vbroadcast", v_nv[i], s_nv[i]) for i in range(7)]
+        for i in range(0, len(all_vb_nv), VALU_LIMIT):
+            self.instrs.append({"valu": all_vb_nv[i:i + VALU_LIMIT]})
+
+        # Alias for build_op_graph dispatch
+        v_nv_root = v_nv[0]   # rounds 0, 10, 11
+
         self.add("flow", ("pause",))
 
         # ── Spec 06: DAG-based multi-context scheduler ────────────────────────
@@ -1157,6 +1393,13 @@ class KernelBuilder:
                 v_nnodes=v_nnodes,
                 context_types=context_types,
                 const_map=self.const_map,
+                v_nv_root=v_nv_root,
+                v_nv1=v_nv[1],
+                v_nv2=v_nv[2],
+                v_nv3=v_nv[3],
+                v_nv4=v_nv[4],
+                v_nv5=v_nv[5],
+                v_nv6=v_nv[6],
             )
             schedule = list_schedule(ops)
             for bundle in schedule:
@@ -1425,6 +1668,113 @@ class Tests(unittest.TestCase):
         op13 = Op(engine='alu', instr=('+', 100, 100, dummy_val), dst=100,
                   dep_srcs=[], context_id=0, round_id=0, stage=0)
         self.assertFalse(b.can_fit(op13), "Should reject 13th ALU op")
+
+    # ── Spec 08 Unit Tests ────────────────────────────────────────────────────
+
+    def _make_dag_layout_and_consts(self, n_ctx=4, dag_base=500):
+        """Helper: build a ScratchLayout + hsc_new + const_map for build_op_graph tests."""
+        from problem import HASH_STAGES
+        context_bases = [dag_base + i * ScratchLayout.WORDS_PER_CTX for i in range(n_ctx)]
+        val_bases = [100 + g * VLEN for g in range(n_ctx)]
+        idx_bases = [200 + g * VLEN for g in range(n_ctx)]
+        layout = ScratchLayout(n_contexts=n_ctx, context_bases=context_bases,
+                               val_bases=val_bases, idx_bases=idx_bases)
+        const_map = {}
+        sp = dag_base + n_ctx * ScratchLayout.WORDS_PER_CTX
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            is_mul = (op1 == '+' and op2 == '+' and op3 == '<<')
+            for v in ([val1, (1 + (1 << val3)) & 0xFFFFFFFF] if is_mul else [val1, val3]):
+                if v not in const_map:
+                    const_map[v] = sp
+                    sp += 1
+        v_fp = sp; sp += VLEN
+        v_one = sp; sp += VLEN
+        v_two = sp; sp += VLEN
+        v_nnodes = sp; sp += VLEN
+        v_nv_root = sp; sp += VLEN
+        v_nv_delta = sp; sp += VLEN
+        v_nv_base = sp; sp += VLEN
+        hsc_new = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            is_mul = (op1 == '+' and op2 == '+' and op3 == '<<')
+            if is_mul:
+                factor = (1 + (1 << val3)) & 0xFFFFFFFF
+                hsc_new.append(('mul', const_map[factor], const_map[val1]))
+            else:
+                hsc_new.append(('xor', op1, const_map[val1], op2, op3, const_map[val3]))
+        return layout, hsc_new, const_map, v_fp, v_one, v_two, v_nnodes, v_nv_root, v_nv_delta, v_nv_base
+
+    def test_FR1_round_class_all_rounds(self):
+        """T1 (Spec 08): Verify all 16 round_ids map to correct class strings."""
+        self.assertEqual(round_class(0),  'software_nv')
+        self.assertEqual(round_class(1),  'software_nv')
+        self.assertEqual(round_class(11), 'software_nv')
+        self.assertEqual(round_class(12), 'software_nv')
+        self.assertEqual(round_class(2),  'level2')
+        self.assertEqual(round_class(13), 'level2')
+        self.assertEqual(round_class(10), 'wrap')
+        self.assertEqual(round_class(15), 'last')
+        for r in (3, 4, 5, 6, 7, 8, 9, 14):
+            self.assertEqual(round_class(r), 'scatter', f"round {r} should be scatter")
+
+    def test_FR3_no_loads_software_nv_round0(self):
+        """T2 (Spec 08): software_nv round 0 — 0 scatter load ops per context."""
+        layout, hsc_new, const_map, v_fp, v_one, v_two, v_nnodes, v_nv_root, v_nv_delta, v_nv_base = \
+            self._make_dag_layout_and_consts()
+        context_types = assign_context_types([0])
+        ops = build_op_graph([0], [0], layout, hsc_new, v_fp, v_one, v_two, v_nnodes,
+                             context_types=context_types, const_map=const_map,
+                             v_nv_root=v_nv_root, v_nv_delta=v_nv_delta, v_nv_base=v_nv_base)
+        load_ops = [o for o in ops if o.engine == 'load']
+        self.assertEqual(len(load_ops), 0,
+                         f"software_nv round 0 should have 0 load ops, got {len(load_ops)}")
+
+    def test_FR3_loads_scatter_round3(self):
+        """T3 (Spec 08): scatter round 3 — 8 scatter load ops per context."""
+        layout, hsc_new, const_map, v_fp, v_one, v_two, v_nnodes, v_nv_root, v_nv_delta, v_nv_base = \
+            self._make_dag_layout_and_consts()
+        context_types = assign_context_types([0])
+        ops = build_op_graph([0], [3], layout, hsc_new, v_fp, v_one, v_two, v_nnodes,
+                             context_types=context_types, const_map=const_map,
+                             v_nv_root=v_nv_root, v_nv_delta=v_nv_delta, v_nv_base=v_nv_base)
+        load_ops = [o for o in ops if o.engine == 'load']
+        self.assertEqual(len(load_ops), 8,
+                         f"scatter round 3 should have 8 load ops (VLEN={VLEN}), got {len(load_ops)}")
+
+    def test_FR4_no_nav_last_round(self):
+        """T4 (Spec 08): last round (15) — 0 nav ops per context."""
+        layout, hsc_new, const_map, v_fp, v_one, v_two, v_nnodes, v_nv_root, v_nv_delta, v_nv_base = \
+            self._make_dag_layout_and_consts()
+        context_types = assign_context_types([0])
+        # Use only round 15 so last_round == 15 and nav is skipped
+        ops = build_op_graph([0], [15], layout, hsc_new, v_fp, v_one, v_two, v_nnodes,
+                             context_types=context_types, const_map=const_map,
+                             v_nv_root=v_nv_root, v_nv_delta=v_nv_delta, v_nv_base=v_nv_base)
+        idx_buf = layout.idx_buf(0)
+        # Nav ops write idx_buf. When round 15 is last_round, no nav should be emitted.
+        nav_ops = [o for o in ops if o.dst == idx_buf and o.round_id == 15
+                   and o.engine == 'valu']
+        # Filter to only nav-stage ops (stage > hash stage range, i.e. after hash)
+        # The gi-doubler and nav A/B/C/D all write idx_buf or tmp_nav/tmp_vld
+        # Simplest: count ops that write idx_buf in round 15 and are valu (gi-doubler + nav_b + nav_d)
+        self.assertEqual(len(nav_ops), 0,
+                         f"last round 15 should have 0 nav ops writing idx_buf, got {len(nav_ops)}")
+
+    def test_FR4_wrap_nav_round10(self):
+        """T5 (Spec 08): wrap round 10 — exactly 1 nav op (gi-clear)."""
+        layout, hsc_new, const_map, v_fp, v_one, v_two, v_nnodes, v_nv_root, v_nv_delta, v_nv_base = \
+            self._make_dag_layout_and_consts()
+        context_types = assign_context_types([0])
+        # Use rounds [10, 11] so round 10 is not last_round
+        ops = build_op_graph([0], [10, 11], layout, hsc_new, v_fp, v_one, v_two, v_nnodes,
+                             context_types=context_types, const_map=const_map,
+                             v_nv_root=v_nv_root, v_nv_delta=v_nv_delta, v_nv_base=v_nv_base)
+        idx_buf = layout.idx_buf(0)
+        # Nav ops for round 10 that write idx_buf (the self-XOR clear)
+        wrap_nav_ops = [o for o in ops if o.round_id == 10 and o.dst == idx_buf
+                        and o.engine == 'valu']
+        self.assertEqual(len(wrap_nav_ops), 1,
+                         f"wrap round 10 should have exactly 1 nav op (gi-clear), got {len(wrap_nav_ops)}")
 
 
 # To run all the tests:
