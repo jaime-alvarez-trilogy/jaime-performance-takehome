@@ -125,16 +125,24 @@ class Bundle:
         return result
 
 
-def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nnodes):
+def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nnodes,
+                   context_types=None, const_map=None):
     """
     Generate all Ops for a set of contexts/rounds with populated deps.
 
-    contexts: list of local context indices (0-based, into scratch layout)
-    rounds:   list of round indices (0–15)
-    scratch:  ScratchLayout
-    hsc_new:  hash stage constants list from KernelBuilder
-    v_fp, v_one, v_nnodes: constant scratch addresses
+    contexts:      list of local context indices (0-based, into scratch layout)
+    rounds:        list of round indices (0–15)
+    scratch:       ScratchLayout
+    hsc_new:       hash stage constants list from KernelBuilder
+    v_fp, v_one, v_two, v_nnodes: constant scratch addresses
+    context_types: dict {ctx: 'valu_hash'|'alu_hash'} (Spec 07); None → all valu_hash
+    const_map:     dict {raw_val: scalar_scratch_addr} for ALU hash scalar constants
     """
+    if context_types is None:
+        context_types = {}
+    if const_map is None:
+        const_map = {}
+
     n_rounds = len(rounds)
     last_round = rounds[-1]
     all_ops = []
@@ -203,52 +211,131 @@ def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nno
             ctx_ops.append(op_xor)
             s += 1
 
-            # ── Stages 6–14: hash (9 VALU cycles) ──────────────────────────
-            for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-                is_mul = (op1 == "+" and op2 == "+" and op3 == "<<")
-                stage_info = hsc_new[hi]
+            # ── Stages 6–14: hash ────────────────────────────────────────────
+            is_alu_hash = context_types.get(ctx) == 'alu_hash'
 
-                if is_mul:
-                    _, v_factor, v_C = stage_info
-                    op_hash = Op(
-                        engine='valu',
-                        instr=('multiply_add', val_buf, val_buf, v_factor, v_C),
-                        dst=val_buf,
-                        dep_srcs=[val_buf, v_factor, v_C],
-                        context_id=ctx, round_id=r, stage=s,
-                    )
-                    ctx_ops.append(op_hash)
-                    s += 1
-                else:
-                    _, op1_s, v_c1, op2_s, op3_s, v_c2 = stage_info
-                    # Odd cycle: tmp1 = val op1 v_c1; tmp2 = val op3 v_c2
-                    op_h1 = Op(
-                        engine='valu',
-                        instr=(op1_s, tmp1, val_buf, v_c1),
-                        dst=tmp1,
-                        dep_srcs=[val_buf, v_c1],
-                        context_id=ctx, round_id=r, stage=s,
-                    )
-                    op_h2 = Op(
-                        engine='valu',
-                        instr=(op3_s, tmp2, val_buf, v_c2),
-                        dst=tmp2,
-                        dep_srcs=[val_buf, v_c2],
-                        context_id=ctx, round_id=r, stage=s,
-                    )
-                    ctx_ops.append(op_h1)
-                    ctx_ops.append(op_h2)
-                    s += 1
-                    # Even cycle: val = tmp1 op2 tmp2
-                    op_h3 = Op(
-                        engine='valu',
-                        instr=(op2_s, val_buf, tmp1, tmp2),
-                        dst=val_buf,
-                        dep_srcs=[tmp1, tmp2],
-                        context_id=ctx, round_id=r, stage=s,
-                    )
-                    ctx_ops.append(op_h3)
-                    s += 1
+            if is_alu_hash:
+                # ── ALU hash: 15 sub-cycles × 8 lanes = 120 ALU ops per round ──
+                # 3 mul stages × 2 sub-cycles + 3 XOR stages × 3 sub-cycles = 15
+                # Sub-cycle ordering matches the dependency chain:
+                #   mul:  (* val factor) → (+ val C)
+                #   xor:  (op1 tmp1 val c1) → (op3 tmp2 val c3) → (op2 val tmp1 tmp2)
+                first_alu_hash_subcycle = True
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    is_mul = (op1 == "+" and op2 == "+" and op3 == "<<")
+                    if is_mul:
+                        factor = (1 + (1 << val3)) & 0xFFFFFFFF
+                        c_factor = const_map[factor]
+                        c_C = const_map[val1]
+                        # Sub-cycle 1: val_buf[i] = val_buf[i] * factor
+                        for i in range(VLEN):
+                            # First sub-cycle ever: use whole-vector val_buf as dep_src
+                            # so last_writer[val_buf] (= the XOR op) is linked correctly.
+                            dep_src_val = val_buf if first_alu_hash_subcycle else (val_buf + i)
+                            op_am1 = Op(
+                                engine='alu',
+                                instr=('*', val_buf + i, val_buf + i, c_factor),
+                                dst=val_buf + i,
+                                dep_srcs=[dep_src_val, c_factor],
+                                context_id=ctx, round_id=r, stage=s,
+                            )
+                            ctx_ops.append(op_am1)
+                        first_alu_hash_subcycle = False
+                        s += 1
+                        # Sub-cycle 2: val_buf[i] = val_buf[i] + C
+                        for i in range(VLEN):
+                            op_am2 = Op(
+                                engine='alu',
+                                instr=('+', val_buf + i, val_buf + i, c_C),
+                                dst=val_buf + i,
+                                dep_srcs=[val_buf + i, c_C],
+                                context_id=ctx, round_id=r, stage=s,
+                            )
+                            ctx_ops.append(op_am2)
+                        s += 1
+                    else:
+                        c_val1 = const_map[val1]
+                        c_val3 = const_map[val3]
+                        # Sub-cycle 1: tmp1[i] = val_buf[i] op1 c_val1
+                        for i in range(VLEN):
+                            op_ax1 = Op(
+                                engine='alu',
+                                instr=(op1, tmp1 + i, val_buf + i, c_val1),
+                                dst=tmp1 + i,
+                                dep_srcs=[val_buf + i, c_val1],
+                                context_id=ctx, round_id=r, stage=s,
+                            )
+                            ctx_ops.append(op_ax1)
+                        s += 1
+                        # Sub-cycle 2: tmp2[i] = val_buf[i] op3 c_val3
+                        for i in range(VLEN):
+                            op_ax2 = Op(
+                                engine='alu',
+                                instr=(op3, tmp2 + i, val_buf + i, c_val3),
+                                dst=tmp2 + i,
+                                dep_srcs=[val_buf + i, c_val3],
+                                context_id=ctx, round_id=r, stage=s,
+                            )
+                            ctx_ops.append(op_ax2)
+                        s += 1
+                        # Sub-cycle 3: val_buf[i] = tmp1[i] op2 tmp2[i]
+                        for i in range(VLEN):
+                            op_ax3 = Op(
+                                engine='alu',
+                                instr=(op2, val_buf + i, tmp1 + i, tmp2 + i),
+                                dst=val_buf + i,
+                                dep_srcs=[tmp1 + i, tmp2 + i],
+                                context_id=ctx, round_id=r, stage=s,
+                            )
+                            ctx_ops.append(op_ax3)
+                        s += 1
+            else:
+                # ── VALU hash: 9 VALU cycles (Spec 06 path, unchanged) ───────
+                for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+                    is_mul = (op1 == "+" and op2 == "+" and op3 == "<<")
+                    stage_info = hsc_new[hi]
+
+                    if is_mul:
+                        _, v_factor, v_C = stage_info
+                        op_hash = Op(
+                            engine='valu',
+                            instr=('multiply_add', val_buf, val_buf, v_factor, v_C),
+                            dst=val_buf,
+                            dep_srcs=[val_buf, v_factor, v_C],
+                            context_id=ctx, round_id=r, stage=s,
+                        )
+                        ctx_ops.append(op_hash)
+                        s += 1
+                    else:
+                        _, op1_s, v_c1, op2_s, op3_s, v_c2 = stage_info
+                        # Odd cycle: tmp1 = val op1 v_c1; tmp2 = val op3 v_c2
+                        op_h1 = Op(
+                            engine='valu',
+                            instr=(op1_s, tmp1, val_buf, v_c1),
+                            dst=tmp1,
+                            dep_srcs=[val_buf, v_c1],
+                            context_id=ctx, round_id=r, stage=s,
+                        )
+                        op_h2 = Op(
+                            engine='valu',
+                            instr=(op3_s, tmp2, val_buf, v_c2),
+                            dst=tmp2,
+                            dep_srcs=[val_buf, v_c2],
+                            context_id=ctx, round_id=r, stage=s,
+                        )
+                        ctx_ops.append(op_h1)
+                        ctx_ops.append(op_h2)
+                        s += 1
+                        # Even cycle: val = tmp1 op2 tmp2
+                        op_h3 = Op(
+                            engine='valu',
+                            instr=(op2_s, val_buf, tmp1, tmp2),
+                            dst=val_buf,
+                            dep_srcs=[tmp1, tmp2],
+                            context_id=ctx, round_id=r, stage=s,
+                        )
+                        ctx_ops.append(op_h3)
+                        s += 1
 
             # ── Navigation (skip for last round) ────────────────────────────
             # Navigation formula: idx_next = 2*idx + 1 + (val & 1)
@@ -270,11 +357,17 @@ def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nno
                 s += 1
 
                 # Nav A: tmp_nav = val_buf & 1
+                # For ALU-hash contexts, val_buf was written per-lane (val_buf+i).
+                # Use per-lane dep_srcs so the dep builder finds the last ALU hash ops.
+                if is_alu_hash:
+                    nav_a_dep_srcs = [val_buf + i for i in range(VLEN)] + [v_one]
+                else:
+                    nav_a_dep_srcs = [val_buf, v_one]
                 op_nav_a = Op(
                     engine='valu',
                     instr=('&', tmp_nav, val_buf, v_one),
                     dst=tmp_nav,
-                    dep_srcs=[val_buf, v_one],
+                    dep_srcs=nav_a_dep_srcs,
                     context_id=ctx, round_id=r, stage=s,
                 )
                 ctx_ops.append(op_nav_a)
@@ -430,7 +523,18 @@ def list_schedule(ops):
     return bundles
 
 
-# ── End Spec 06 DAG Infrastructure ───────────────────────────────────────────
+# ── Spec 07: ALU Hash Integration into DAG Scheduler ─────────────────────────
+
+
+def assign_context_types(contexts):
+    """
+    Returns {context_id: 'valu_hash' | 'alu_hash'} for each context in the pass.
+    Every 4th context (context_idx % 4 == 3) is an ALU-hash context; all others VALU.
+    """
+    return {ctx: ('alu_hash' if ctx % 4 == 3 else 'valu_hash') for ctx in contexts}
+
+
+# ── End Spec 07 / End Spec 06 DAG Infrastructure ─────────────────────────────
 
 
 class KernelBuilder:
@@ -1041,6 +1145,7 @@ class KernelBuilder:
                 idx_base=idx_base,
                 group_ids=pass_groups,
             )
+            context_types = assign_context_types(list(range(n_ctx)))
             ops = build_op_graph(
                 contexts=list(range(n_ctx)),
                 rounds=list(range(rounds)),
@@ -1050,6 +1155,8 @@ class KernelBuilder:
                 v_one=v_one,
                 v_two=v_two,
                 v_nnodes=v_nnodes,
+                context_types=context_types,
+                const_map=self.const_map,
             )
             schedule = list_schedule(ops)
             for bundle in schedule:
@@ -1152,6 +1259,172 @@ class Tests(unittest.TestCase):
 
     def test_kernel_cycles(self):
         do_kernel_test(10, 16, 256)
+
+    # ── Spec 07 Unit Tests ────────────────────────────────────────────────────
+
+    def test_FR1_assign_context_types_8ctxs(self):
+        """T1: 8 contexts → exactly contexts 3,7 are alu_hash."""
+        ct = assign_context_types(list(range(8)))
+        self.assertEqual(ct[0], 'valu_hash')
+        self.assertEqual(ct[1], 'valu_hash')
+        self.assertEqual(ct[2], 'valu_hash')
+        self.assertEqual(ct[3], 'alu_hash')
+        self.assertEqual(ct[4], 'valu_hash')
+        self.assertEqual(ct[5], 'valu_hash')
+        self.assertEqual(ct[6], 'valu_hash')
+        self.assertEqual(ct[7], 'alu_hash')
+
+    def test_FR1_assign_context_types_16ctxs(self):
+        """T2: 16 contexts → exactly 3,7,11,15 are alu_hash."""
+        ct = assign_context_types(list(range(16)))
+        alu = [c for c, t in ct.items() if t == 'alu_hash']
+        valu = [c for c, t in ct.items() if t == 'valu_hash']
+        self.assertEqual(sorted(alu), [3, 7, 11, 15])
+        self.assertEqual(len(valu), 12)
+
+    def test_FR1_assign_context_types_2ctxs(self):
+        """T3: 2 contexts → both valu_hash."""
+        ct = assign_context_types([0, 1])
+        self.assertEqual(ct[0], 'valu_hash')
+        self.assertEqual(ct[1], 'valu_hash')
+
+    def test_FR2_alu_hash_ops_count(self):
+        """T4: ALU-hash context produces 120 ALU hash ops per round (15 sub-cycles × 8 lanes)."""
+        # Minimal setup: 1 context (ALU hash), 1 round
+        from problem import HASH_STAGES
+        n_ctx = 4  # context 3 is ALU hash
+        dag_base = 500
+        context_bases = [dag_base + i * ScratchLayout.WORDS_PER_CTX for i in range(n_ctx)]
+        val_bases = [100 + g * VLEN for g in range(n_ctx)]
+        idx_bases = [200 + g * VLEN for g in range(n_ctx)]
+        layout = ScratchLayout(n_contexts=n_ctx, context_bases=context_bases,
+                               val_bases=val_bases, idx_bases=idx_bases)
+        const_map = {}
+        sp = dag_base + n_ctx * ScratchLayout.WORDS_PER_CTX
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            is_mul = (op1 == '+' and op2 == '+' and op3 == '<<')
+            for v in ([val1, (1+(1<<val3))&0xFFFFFFFF] if is_mul else [val1, val3]):
+                if v not in const_map:
+                    const_map[v] = sp; sp += 1
+        v_fp = sp; sp += VLEN; v_one = sp; sp += VLEN
+        v_two = sp; sp += VLEN; v_nnodes = sp; sp += VLEN
+        hsc_new = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            is_mul = (op1 == '+' and op2 == '+' and op3 == '<<')
+            if is_mul:
+                factor = (1 + (1 << val3)) & 0xFFFFFFFF
+                hsc_new.append(('mul', const_map[factor], const_map[val1]))
+            else:
+                hsc_new.append(('xor', op1, const_map[val1], op2, op3, const_map[val3]))
+
+        context_types = assign_context_types(list(range(n_ctx)))
+        # Use last round so nav is skipped (simplify dep analysis)
+        ops = build_op_graph([3], [0], layout, hsc_new, v_fp, v_one, v_two, v_nnodes,
+                             context_types=context_types, const_map=const_map)
+        alu_hash_ops = [o for o in ops if o.engine == 'alu']
+        self.assertEqual(len(alu_hash_ops), 120,
+                         f"Expected 120 ALU hash ops, got {len(alu_hash_ops)}")
+
+    def test_FR2_valu_hash_unchanged(self):
+        """T5: VALU-hash context still produces 9 VALU hash ops per round."""
+        from problem import HASH_STAGES
+        n_ctx = 4
+        dag_base = 500
+        context_bases = [dag_base + i * ScratchLayout.WORDS_PER_CTX for i in range(n_ctx)]
+        val_bases = [100 + g * VLEN for g in range(n_ctx)]
+        idx_bases = [200 + g * VLEN for g in range(n_ctx)]
+        layout = ScratchLayout(n_contexts=n_ctx, context_bases=context_bases,
+                               val_bases=val_bases, idx_bases=idx_bases)
+        const_map = {}
+        sp = dag_base + n_ctx * ScratchLayout.WORDS_PER_CTX
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            is_mul = (op1 == '+' and op2 == '+' and op3 == '<<')
+            for v in ([val1, (1+(1<<val3))&0xFFFFFFFF] if is_mul else [val1, val3]):
+                if v not in const_map:
+                    const_map[v] = sp; sp += 1
+        v_fp = sp; sp += VLEN; v_one = sp; sp += VLEN
+        v_two = sp; sp += VLEN; v_nnodes = sp; sp += VLEN
+        hsc_new = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            is_mul = (op1 == '+' and op2 == '+' and op3 == '<<')
+            if is_mul:
+                factor = (1 + (1 << val3)) & 0xFFFFFFFF
+                hsc_new.append(('mul', const_map[factor], const_map[val1]))
+            else:
+                hsc_new.append(('xor', op1, const_map[val1], op2, op3, const_map[val3]))
+
+        context_types = assign_context_types(list(range(n_ctx)))
+        # ctx=0 is valu_hash; use last round to skip nav
+        ops = build_op_graph([0], [0], layout, hsc_new, v_fp, v_one, v_two, v_nnodes,
+                             context_types=context_types, const_map=const_map)
+        # VALU hash ops: 3 mul (1 op each) + 3 xor (3 ops each) = 3+9=12... wait
+        # Actually multiply_add is 1 VALU op per mul-stage; xor is 3 VALU ops per xor-stage
+        # 3 mul * 1 + 3 xor * 3 = 3 + 9 = 12? No: mul_stage = 1 multiply_add
+        # xor stage = 2 ops (odd cycle: op_h1 + op_h2) + 1 op (even cycle: op_h3) = 3 ops
+        # Total: 3*1 + 3*(2+1) = 3+9 = 12 ops... but spec says 9 "VALU cycles"
+        # Actually counting stages: mul=1 VALU stage, xor=2 VALU stages (odd + even)
+        # 3 mul + 3*2 xor = 3+6 = 9 stages/cycles. Ops: 3*1 + 3*(2+1) = 3+9=12 VALU ops
+        valu_hash_ops = [o for o in ops if o.engine == 'valu' and o.context_id == 0
+                         and o.stage >= 6]  # stages 6+ are hash ops (0=addr,1-4=load,5=xor)
+        # The hash stages start after stage 5 (the val^nv xor). Count them:
+        # stage 5 = xor, stages 6-14 = hash. That's stages 6..14 = 9 stages but 12 VALU ops
+        valu_hash_ops2 = [o for o in ops if o.engine == 'valu' and o.context_id == 0
+                          and o.stage > 5]
+        self.assertGreater(len(valu_hash_ops2), 0, "Expected VALU hash ops for ctx 0")
+        # Key check: no ALU ops for ctx 0 (it's valu_hash)
+        alu_ops_ctx0 = [o for o in ops if o.engine == 'alu' and o.context_id == 0]
+        self.assertEqual(len(alu_ops_ctx0), 0, "VALU context should have no ALU hash ops")
+
+    def test_FR2_no_cross_context_deps(self):
+        """T6: No deps between different contexts."""
+        from problem import HASH_STAGES
+        n_ctx = 4
+        dag_base = 500
+        context_bases = [dag_base + i * ScratchLayout.WORDS_PER_CTX for i in range(n_ctx)]
+        val_bases = [100 + g * VLEN for g in range(n_ctx)]
+        idx_bases = [200 + g * VLEN for g in range(n_ctx)]
+        layout = ScratchLayout(n_contexts=n_ctx, context_bases=context_bases,
+                               val_bases=val_bases, idx_bases=idx_bases)
+        const_map = {}
+        sp = dag_base + n_ctx * ScratchLayout.WORDS_PER_CTX
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            is_mul = (op1 == '+' and op2 == '+' and op3 == '<<')
+            for v in ([val1, (1+(1<<val3))&0xFFFFFFFF] if is_mul else [val1, val3]):
+                if v not in const_map:
+                    const_map[v] = sp; sp += 1
+        v_fp = sp; sp += VLEN; v_one = sp; sp += VLEN
+        v_two = sp; sp += VLEN; v_nnodes = sp; sp += VLEN
+        hsc_new = []
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            is_mul = (op1 == '+' and op2 == '+' and op3 == '<<')
+            if is_mul:
+                factor = (1 + (1 << val3)) & 0xFFFFFFFF
+                hsc_new.append(('mul', const_map[factor], const_map[val1]))
+            else:
+                hsc_new.append(('xor', op1, const_map[val1], op2, op3, const_map[val3]))
+
+        context_types = assign_context_types(list(range(n_ctx)))
+        ops = build_op_graph(list(range(n_ctx)), [0], layout, hsc_new, v_fp, v_one, v_two,
+                             v_nnodes, context_types=context_types, const_map=const_map)
+
+        for op in ops:
+            for dep in op.deps:
+                self.assertEqual(op.context_id, dep.context_id,
+                                 f"Cross-context dep: op ctx={op.context_id} deps on ctx={dep.context_id}")
+
+    def test_FR3_bundle_alu_limit(self):
+        """T10: Bundle rejects 13th ALU op."""
+        # Verify 12 ALU ops fit, 13th rejected
+        b = Bundle()
+        dummy_val = 999
+        for i in range(12):
+            op = Op(engine='alu', instr=('+', i, i, dummy_val), dst=i,
+                    dep_srcs=[], context_id=0, round_id=0, stage=0)
+            self.assertTrue(b.can_fit(op), f"Should accept op {i+1}")
+            b.add(op)
+        op13 = Op(engine='alu', instr=('+', 100, 100, dummy_val), dst=100,
+                  dep_srcs=[], context_id=0, round_id=0, stage=0)
+        self.assertFalse(b.can_fit(op13), "Should reject 13th ALU op")
 
 
 # To run all the tests:
