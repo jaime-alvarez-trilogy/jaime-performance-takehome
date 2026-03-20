@@ -1406,6 +1406,7 @@ class KernelBuilder:
                              idx_base + ng * VLEN)
                             for j, ng in enumerate(next_next_groups)
                         ]
+                    nav_c_pc = len(self.instrs)  # record before appending (for 05b retroactive fold)
                     if nav_c_valu_ops or len(extra_loads) > 2 or pending_stores:
                         nav_c_bundle = {"valu": nav_c_valu_ops} if nav_c_valu_ops else {"valu": []}
                         if len(extra_loads) > 2:
@@ -1413,8 +1414,13 @@ class KernelBuilder:
                         inject_stores(nav_c_bundle, pending_stores)
                         if nav_c_bundle.get("valu") or nav_c_bundle.get("load") or nav_c_bundle.get("store"):
                             self.instrs.append(nav_c_bundle)
+                        else:
+                            nav_c_pc = None  # bundle was not appended
+                    else:
+                        nav_c_pc = None  # bundle was not appended
 
                     # addr_next2 = deferred_xor (now standalone, after vi=6,7 committed in nav-C)
+                    dx_pc = None  # record for 05b retroactive fold
                     if deferred_xor_group is not None:
                         j_def, ng_def = deferred_xor_group
                         dx_valu = [
@@ -1426,6 +1432,7 @@ class KernelBuilder:
                         if deferred_prologue_addr_j2_overflow is not None:
                             dx_valu = dx_valu + [deferred_prologue_addr_j2_overflow]
                             deferred_prologue_addr_j2_overflow = None
+                        dx_pc = len(self.instrs)  # record before appending
                         dx_bundle = {"valu": dx_valu}
                         inject_stores(dx_bundle, pending_stores)
                         self.instrs.append(dx_bundle)
@@ -1554,79 +1561,8 @@ class KernelBuilder:
                 # Retroactively pack remaining ALU ops into already-emitted nav bundles
                 # (ALU slot is always empty in nav bundles — fully parallel execution).
                 # Mirrors the hash-phase injection pattern (hash_start above).
-                nav_end_pc = len(self.instrs)
-                n_nav_bundles = nav_end_pc - nav_start_pc
-                for i, alu_cycle in enumerate(_remaining_alu_d):
-                    if i < n_nav_bundles:
-                        bundle = self.instrs[nav_start_pc + i]
-                        if "alu" not in bundle:
-                            bundle["alu"] = alu_cycle
-                    else:
-                        alu_bundle = {"alu": alu_cycle}
-                        inject_stores(alu_bundle, pending_stores)
-                        self.instrs.append(alu_bundle)
-
-                # Group D navigation: nav_a_D and nav_b_D
-                # In wrap round: set gi_D = 0 directly
-                # In normal rounds: nav_a_D = val_D & v_one; nav_b_D = gi_D += nav_a_D
-                if is_wrap_round:
-                    nav_a_d_bundle = {"valu": [("vbroadcast", idx_base + d_g * VLEN, c0)]}
-                    inject_stores(nav_a_d_bundle, pending_stores)
-                    self.instrs.append(nav_a_d_bundle)
-                    # XOR D_next with nv_D_next
-                    if not is_last and next_d_g_in_bounds and not software_nv_round:
-                        xor_d_bundle = {"valu": [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]}
-                        inject_stores(xor_d_bundle, pending_stores)
-                        self.instrs.append(xor_d_bundle)
-                else:
-                    # nav_a_D: tmp_nav_D = val_D & 1 (reads hashed val_D, writes tmp_nav_D)
-                    # gi_doubler_d (if active): gi_D = 2*gi_D + 1 (independent of tmp_nav_D, safe to pack)
-                    nav_a_d_valu = [("&", tmp_nav_D, val_base + d_g * VLEN, v_one)]
-                    if gi_doubler_d_op is not None:
-                        nav_a_d_valu = nav_a_d_valu + [gi_doubler_d_op]
-                    nav_a_d_bundle = {"valu": nav_a_d_valu}
-                    inject_stores(nav_a_d_bundle, pending_stores)
-                    self.instrs.append(nav_a_d_bundle)
-                    nav_b_d_bundle = {"valu": [("+", idx_base + d_g * VLEN, idx_base + d_g * VLEN, tmp_nav_D)]}
-                    # XOR D_next with nv_D_next (if not software nv and not last)
-                    # nv_d_next_base is now fully loaded (4 load pairs above)
-                    if not is_last and next_d_g_in_bounds and not software_nv_round:
-                        nav_b_d_bundle["valu"] = nav_b_d_bundle["valu"] + [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]
-                    inject_stores(nav_b_d_bundle, pending_stores)
-                    self.instrs.append(nav_b_d_bundle)
-
-                # For last quadruplet of non-last round before a software_nv round:
-                # fill nv_A[3*VLEN] for next round's qi=0 group D.
-                # nv_fill_ops_for_hash only covers A/B/C (3 ops); D is handled here.
-                if is_last and not is_last_round and next_is_software_nv:
-                    # group 3 is the D group of qi=0 in the next round
-                    d_nv_next_round_group = 3  # = 0*4 + 3
-                    if next_r == 11:  # next round is root
-                        nv_d_next_round_fill = [("vbroadcast", self.nv_A + 3 * VLEN, nv_root_scalar)]
-                    elif next_r == 1 or next_r == rounds - 4:  # next round is level1
-                        nv_d_next_round_fill = [("multiply_add", self.nv_A + 3 * VLEN,
-                                                 idx_base + d_nv_next_round_group * VLEN,
-                                                 v_nv_delta, v_nv_base)]
-                    elif next_r == 2 or next_r == rounds - 3:  # next round is level2
-                        nv_d_next_round_fill = [("&", mask_B_bufs[3],
-                                                 idx_base + d_nv_next_round_group * VLEN, v_one)]
-                    else:
-                        nv_d_next_round_fill = []
-                    if nv_d_next_round_fill:
-                        nv_d_nr_bundle = {"valu": nv_d_next_round_fill}
-                        inject_stores(nv_d_nr_bundle, pending_stores)
-                        self.instrs.append(nv_d_nr_bundle)
-                    if (next_r == 2 or next_r == rounds - 3):  # level2 FLOW vselect for D
-                        # mask_A_bufs[3] must be computed here (not precomputed like A/B/C groups).
-                        # idx[g3] = gi for group 3, now finalized after nav_b_d.
-                        mask_a_d_bundle = {"valu": [("<", mask_A_bufs[3], idx_base + d_nv_next_round_group * VLEN, v_five)]}
-                        inject_stores(mask_a_d_bundle, pending_stores)
-                        self.instrs.append(mask_a_d_bundle)
-                        self.instrs.append({"flow": [("vselect", nv_lo_bufs[3], mask_A_bufs[3], v_nv3, v_nv5)]})
-                        self.instrs.append({"flow": [("vselect", nv_hi_bufs[3], mask_A_bufs[3], v_nv4, v_nv6)]})
-                        self.instrs.append({"flow": [("vselect", self.nv_A + 3 * VLEN, mask_B_bufs[3], nv_lo_bufs[3], nv_hi_bufs[3])]})
-
-                # For software_nv rounds: fill nv_next_buf[3] for group D, then XOR.
+                # For software_nv rounds: emit nv_d_fill + xor_d BEFORE nav_end_pc so
+                # the ALU injector sees them as injection targets (spec 05a).
                 if software_nv_round and not is_last and next_d_g_in_bounds:
                     if is_level1_round:
                         nv_d_fill = [("multiply_add", nv_next_buf + 3 * VLEN, idx_base + next_d_g * VLEN, v_nv_delta, v_nv_base)]
@@ -1658,6 +1594,111 @@ class KernelBuilder:
                     xor_d_bundle = {"valu": [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]}
                     inject_stores(xor_d_bundle, pending_stores)
                     self.instrs.append(xor_d_bundle)
+                nav_end_pc = len(self.instrs)
+                n_nav_bundles = nav_end_pc - nav_start_pc
+                for i, alu_cycle in enumerate(_remaining_alu_d):
+                    if i < n_nav_bundles:
+                        bundle = self.instrs[nav_start_pc + i]
+                        if "alu" not in bundle:
+                            bundle["alu"] = alu_cycle
+                    else:
+                        alu_bundle = {"alu": alu_cycle}
+                        inject_stores(alu_bundle, pending_stores)
+                        self.instrs.append(alu_bundle)
+
+                # Spec 05b: D-nav injection — retroactively fold nav_a_d into nav-C and
+                # nav_b_d into deferred_xor for overflow scatter rounds, eliminating 2
+                # standalone cycles per quadruplet.
+                # Condition: has_overflow, not software_nv_round, not is_wrap_round,
+                # alu[5] (index 5) was injected into a nav bundle (requires n_nav_bundles >= 6),
+                # and nav-C/dx bundles were actually emitted.
+                nav_a_d_folded = False
+                nav_b_d_folded = False
+                if (has_overflow and not software_nv_round and not is_wrap_round
+                        and n_nav_bundles >= 6 and nav_c_pc is not None):
+                    alu5_abs_pc = nav_start_pc + 5  # alu[5] injected here
+                    # RAW check: nav-C must be >= 1 cycle after alu[5] (position 5 writes val_D;
+                    # spec requires reader at position >= 6; nav-C is at position 6 in practice)
+                    if nav_c_pc - alu5_abs_pc >= 1:
+                        nav_a_d_ops = [("&", tmp_nav_D, val_base + d_g * VLEN, v_one)]
+                        if gi_doubler_d_op is not None:
+                            nav_a_d_ops = nav_a_d_ops + [gi_doubler_d_op]
+                        nav_c_b = self.instrs[nav_c_pc]
+                        if len(nav_c_b.get("valu", [])) + len(nav_a_d_ops) <= SLOT_LIMITS["valu"]:
+                            nav_c_b["valu"] = nav_c_b.get("valu", []) + nav_a_d_ops
+                            nav_a_d_folded = True
+                            # nav_b_d: fold into deferred_xor (position nav_c_pc+1, gap=1 from nav_a_d — RAW safe)
+                            if dx_pc is not None:
+                                nav_b_d_ops = [("+", idx_base + d_g * VLEN, idx_base + d_g * VLEN, tmp_nav_D)]
+                                if not is_last and next_d_g_in_bounds and not software_nv_round:
+                                    nav_b_d_ops = nav_b_d_ops + [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]
+                                dx_b = self.instrs[dx_pc]
+                                if len(dx_b.get("valu", [])) + len(nav_b_d_ops) <= SLOT_LIMITS["valu"]:
+                                    dx_b["valu"] = dx_b.get("valu", []) + nav_b_d_ops
+                                    nav_b_d_folded = True
+
+                # Group D navigation: nav_a_D and nav_b_D
+                # In wrap round: set gi_D = 0 directly
+                # In normal rounds: nav_a_D = val_D & v_one; nav_b_D = gi_D += nav_a_D
+                # Spec 05b: skip standalone emission when folded into nav-C / deferred_xor.
+                if is_wrap_round:
+                    nav_a_d_bundle = {"valu": [("vbroadcast", idx_base + d_g * VLEN, c0)]}
+                    inject_stores(nav_a_d_bundle, pending_stores)
+                    self.instrs.append(nav_a_d_bundle)
+                    # XOR D_next with nv_D_next
+                    if not is_last and next_d_g_in_bounds and not software_nv_round:
+                        xor_d_bundle = {"valu": [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]}
+                        inject_stores(xor_d_bundle, pending_stores)
+                        self.instrs.append(xor_d_bundle)
+                else:
+                    if not nav_a_d_folded:
+                        # nav_a_D: tmp_nav_D = val_D & 1 (reads hashed val_D, writes tmp_nav_D)
+                        # gi_doubler_d (if active): gi_D = 2*gi_D + 1 (independent, safe to pack)
+                        nav_a_d_valu = [("&", tmp_nav_D, val_base + d_g * VLEN, v_one)]
+                        if gi_doubler_d_op is not None:
+                            nav_a_d_valu = nav_a_d_valu + [gi_doubler_d_op]
+                        nav_a_d_bundle = {"valu": nav_a_d_valu}
+                        inject_stores(nav_a_d_bundle, pending_stores)
+                        self.instrs.append(nav_a_d_bundle)
+                    if not nav_b_d_folded:
+                        nav_b_d_bundle = {"valu": [("+", idx_base + d_g * VLEN, idx_base + d_g * VLEN, tmp_nav_D)]}
+                        # XOR D_next with nv_D_next (if not software nv and not last)
+                        # nv_d_next_base is now fully loaded (4 load pairs above)
+                        if not is_last and next_d_g_in_bounds and not software_nv_round:
+                            nav_b_d_bundle["valu"] = nav_b_d_bundle["valu"] + [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]
+                        inject_stores(nav_b_d_bundle, pending_stores)
+                        self.instrs.append(nav_b_d_bundle)
+
+                # For last quadruplet of non-last round before a software_nv round:
+                # fill nv_A[3*VLEN] for next round's qi=0 group D.
+                # nv_fill_ops_for_hash only covers A/B/C (3 ops); D is handled here.
+                if is_last and not is_last_round and next_is_software_nv:
+                    # group 3 is the D group of qi=0 in the next round
+                    d_nv_next_round_group = 3  # = 0*4 + 3
+                    if next_r == 11:  # next round is root
+                        nv_d_next_round_fill = [("vbroadcast", self.nv_A + 3 * VLEN, nv_root_scalar)]
+                    elif next_r == 1 or next_r == rounds - 4:  # next round is level1
+                        nv_d_next_round_fill = [("multiply_add", self.nv_A + 3 * VLEN,
+                                                 idx_base + d_nv_next_round_group * VLEN,
+                                                 v_nv_delta, v_nv_base)]
+                    elif next_r == 2 or next_r == rounds - 3:  # next round is level2
+                        nv_d_next_round_fill = [("&", mask_B_bufs[3],
+                                                 idx_base + d_nv_next_round_group * VLEN, v_one)]
+                    else:
+                        nv_d_next_round_fill = []
+                    if nv_d_next_round_fill:
+                        nv_d_nr_bundle = {"valu": nv_d_next_round_fill}
+                        inject_stores(nv_d_nr_bundle, pending_stores)
+                        self.instrs.append(nv_d_nr_bundle)
+                    if (next_r == 2 or next_r == rounds - 3):  # level2 FLOW vselect for D
+                        # mask_A_bufs[3] must be computed here (not precomputed like A/B/C groups).
+                        # idx[g3] = gi for group 3, now finalized after nav_b_d.
+                        mask_a_d_bundle = {"valu": [("<", mask_A_bufs[3], idx_base + d_nv_next_round_group * VLEN, v_five)]}
+                        inject_stores(mask_a_d_bundle, pending_stores)
+                        self.instrs.append(mask_a_d_bundle)
+                        self.instrs.append({"flow": [("vselect", nv_lo_bufs[3], mask_A_bufs[3], v_nv3, v_nv5)]})
+                        self.instrs.append({"flow": [("vselect", nv_hi_bufs[3], mask_A_bufs[3], v_nv4, v_nv6)]})
+                        self.instrs.append({"flow": [("vselect", self.nv_A + 3 * VLEN, mask_B_bufs[3], nv_lo_bufs[3], nv_hi_bufs[3])]})
 
                 # nav-D bounds: deferred to hi=0 even of qi+1's hash
                 # FR3: gi=0 is already correct (all wrap); skip bounds check and multiply.
