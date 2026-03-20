@@ -398,9 +398,9 @@ class KernelBuilder:
         self.tmp2_A = self.alloc_scratch("tmp2_A", VLEN)
         self.tmp2_B = self.alloc_scratch("tmp2_B", VLEN)
         self.tmp2_C = self.alloc_scratch("tmp2_C", VLEN)
-        self.nv_A      = self.alloc_scratch("nv_A",      VLEN * 3)  # node values, buffer A (3 groups)
-        self.nv_B      = self.alloc_scratch("nv_B",      VLEN * 3)  # node values, buffer B (ping-pong)
-        self.addr_next = self.alloc_scratch("addr_next", VLEN * 3)  # scatter addrs for next triplet
+        self.nv_A      = self.alloc_scratch("nv_A",      VLEN * 4)  # node values, buffer A (4 groups, k=4)
+        self.nv_B      = self.alloc_scratch("nv_B",      VLEN * 4)  # node values, buffer B (ping-pong)
+        self.addr_next = self.alloc_scratch("addr_next", VLEN * 4)  # scatter addrs for next quadruplet
         # Spec 03 FR2: per-group nav temporaries (packed multi-group navigation)
         tmp_nav_A = self.alloc_scratch("tmp_nav_A", VLEN)
         tmp_nav_B = self.alloc_scratch("tmp_nav_B", VLEN)
@@ -408,6 +408,10 @@ class KernelBuilder:
         tmp_vld_A = self.alloc_scratch("tmp_vld_A", VLEN)
         tmp_vld_B = self.alloc_scratch("tmp_vld_B", VLEN)
         tmp_vld_C = self.alloc_scratch("tmp_vld_C", VLEN)
+        self.tmp1_D = self.alloc_scratch("tmp1_D", VLEN)
+        self.tmp2_D = self.alloc_scratch("tmp2_D", VLEN)
+        tmp_nav_D = self.alloc_scratch("tmp_nav_D", VLEN)
+        tmp_vld_D = self.alloc_scratch("tmp_vld_D", VLEN)
         tmp_s    = self.alloc_scratch("tmp_s")            # scalar scratch
         nv_root_scalar = self.alloc_scratch("nv_root_scalar", 1)  # forest_values[0] (all gi=0 at round 0)
         # Spec 04 FR1: scratch for software nv constants (rounds 1, 12 where gi ∈ {1,2})
@@ -428,10 +432,10 @@ class KernelBuilder:
         v_nv6 = self.alloc_scratch("v_nv6", VLEN)
         v_five = self.alloc_scratch("v_five", VLEN)  # vbroadcast(5) for mask_A = (gi < 5)
         # Temp buffers for 3-group FLOW-based nv computation (shared across triplets)
-        mask_A_bufs = [self.alloc_scratch(f"mask_A_{i}", VLEN) for i in range(3)]
-        nv_lo_bufs  = [self.alloc_scratch(f"nv_lo_{i}",  VLEN) for i in range(3)]
-        nv_hi_bufs  = [self.alloc_scratch(f"nv_hi_{i}",  VLEN) for i in range(3)]
-        mask_B_bufs = [self.alloc_scratch(f"mask_B_{i}", VLEN) for i in range(3)]
+        mask_A_bufs = [self.alloc_scratch(f"mask_A_{i}", VLEN) for i in range(4)]
+        nv_lo_bufs  = [self.alloc_scratch(f"nv_lo_{i}",  VLEN) for i in range(4)]
+        nv_hi_bufs  = [self.alloc_scratch(f"nv_hi_{i}",  VLEN) for i in range(4)]
+        mask_B_bufs = [self.alloc_scratch(f"mask_B_{i}", VLEN) for i in range(4)]
 
         # Memory header pointers (loaded from mem[4..6]) — pack 2 per instruction
         self.alloc_scratch("forest_values_p")
@@ -573,6 +577,7 @@ class KernelBuilder:
             ("vbroadcast", self.nv_A,             nv_root_scalar),
             ("vbroadcast", self.nv_A + VLEN,      nv_root_scalar),
             ("vbroadcast", self.nv_A + 2 * VLEN,  nv_root_scalar),
+            ("vbroadcast", self.nv_A + 3 * VLEN,  nv_root_scalar),
             # Spec 04 FR1: software nv constants for rounds with gi ∈ {1,2}
             ("vbroadcast", v_nv_delta, nv_delta_scalar),
             ("vbroadcast", v_nv_base,  nv_base_scalar),
@@ -731,24 +736,25 @@ class KernelBuilder:
 
         self.add("flow", ("pause",))
 
-        # ── Main loop (unrolled: rounds x triplets of groups) ────────────────
-        # Spec 01: 3-group interleaved hash pipeline.
+        # ── Main loop (unrolled: rounds x quadruplets of groups) ─────────────
+        # Spec 01: 3-group interleaved VALU hash pipeline (A/B/C).
         # Spec 02: load/compute overlap with double-buffered nv_A/nv_B.
         # Spec 03: packed multi-group navigation + vselect→multiply + xor overlap.
+        # Spec 05: 4th group (D) handled via ALU hash pipeline in parallel.
         tmp1_slots = [self.tmp1_A, self.tmp1_B, self.tmp1_C]
         tmp2_slots = [self.tmp2_A, self.tmp2_B, self.tmp2_C]
         # Per-group nav temps: index into these by position within triplet (0,1,2)
         tmp_nav_slots = [tmp_nav_A, tmp_nav_B, tmp_nav_C]
         tmp_vld_slots = [tmp_vld_A, tmp_vld_B, tmp_vld_C]
-        n_triplets = (n_groups + 2) // 3  # ceil(n_groups / 3) = 11 for n_groups=32
+        n_quadruplets = n_groups // 4  # = 8 for n_groups=32
         nv_bufs = [self.nv_A, self.nv_B]
 
         first_groups = [g for g in [0, 1, 2] if g < n_groups]
 
         # Cross-round deferred nav-D/E: carry prev_nav_d_bounds and prev_nav_e across rounds.
-        # For non-last rounds, ti=10's nav-D and nav-E are deferred into round r+1's ti=0 hash.
+        # For non-last rounds, qi=7's nav-D and nav-E are deferred into round r+1's qi=0 hash.
         prev_nav_d_bounds = []
-        # Spec 04: Flag to skip ti=0 xor if it was pre-applied by previous round's nav.
+        # Spec 04: Flag to skip qi=0 xor if it was pre-applied by previous round's nav.
         skip_ti0_xor = False
         prev_nav_e = []
 
@@ -786,41 +792,49 @@ class KernelBuilder:
             # previous round's last triplet hash (nv_fill_ops_for_hash). No
             # standalone prologue cycle needed. ─────────────────────────────
 
-            # ── Main triplet loop ─────────────────────────────────────────────
-            # nav-D bounds and nav-E of triplet ti are deferred into triplet ti+1's hash
-            # even cycles (hi=0 and hi=1), saving 2 cycles per non-last triplet.
-            # For non-last rounds, ti=10's nav-D/E are deferred into the NEXT ROUND's
-            # ti=0 hash (cross-round deferred nav), saving 2 cycles per round.
+            # ── Main quadruplet loop ──────────────────────────────────────────
+            # nav-D bounds and nav-E of quadruplet qi are deferred into qi+1's hash
+            # even cycles (hi=0 and hi=1), saving 2 cycles per non-last quadruplet.
+            # For non-last rounds, qi=7's nav-D/E are deferred into the NEXT ROUND's
+            # qi=0 hash (cross-round deferred nav), saving 2 cycles per round.
             # prev_nav_d_bounds and prev_nav_e are carried across round boundaries.
 
-            nv_preloaded_early = False  # set True at ti=n_triplets-2 when vi=6,7 of group 2 pre-loaded
-            for ti in range(n_triplets):
-                a, b, c = ti * 3, ti * 3 + 1, ti * 3 + 2
-                groups = [g for g in [a, b, c] if g < n_groups]
-                nv_cur      = nv_bufs[ti % 2]
-                nv_next_buf = nv_bufs[(ti + 1) % 2]
-                is_last = (ti == n_triplets - 1)
+            nv_preloaded_early = False  # set True at qi=n_quadruplets-2 when vi=6,7 of group 2 pre-loaded
+            for qi in range(n_quadruplets):
+                a, b, c = qi * 4, qi * 4 + 1, qi * 4 + 2
+                d_g = qi * 4 + 3  # group D index (handled by ALU hash)
+                groups = [a, b, c]  # A/B/C for VALU (always exactly 3 groups)
+                nv_cur      = nv_bufs[qi % 2]
+                nv_next_buf = nv_bufs[(qi + 1) % 2]
+                is_last = (qi == n_quadruplets - 1)
 
-                # Next triplet's groups (for addr_next and prefetch)
+                # Next quadruplet's groups (for addr_next and prefetch)
                 if not is_last:
-                    na, nb, nc = (ti + 1) * 3, (ti + 1) * 3 + 1, (ti + 1) * 3 + 2
+                    na, nb, nc = (qi + 1) * 4, (qi + 1) * 4 + 1, (qi + 1) * 4 + 2
+                    next_d_g = (qi + 1) * 4 + 3
                     next_groups = [g for g in [na, nb, nc] if g < n_groups]
+                    next_d_g_in_bounds = next_d_g < n_groups
                 else:
                     next_groups = []
+                    next_d_g = -1
+                    next_d_g_in_bounds = False
 
                 # Spec 04: For level1/root/level2 rounds, no scatter loads needed for nv.
                 # Instead, nv is computed via multiply_add (level1), vbroadcast (root),
                 # or FLOW vselect (level2).
                 software_nv_round = is_level1_round or is_root_round or is_level2_round
-                # Effective n_next_groups for scatter load purposes
+                # Effective n_next_groups for scatter load purposes (A/B/C only = 3 groups)
+                # D's nv is handled separately via _d_nv_loads mechanism
                 scatter_n_next = 0 if software_nv_round else len(next_groups)
 
-                # Spec 04: Build nv_fill_ops and flow_schedule for next triplet
+                # Spec 04: Build nv_fill_ops and flow_schedule for next quadruplet
                 # (nv_fill_ops packed into hash free VALU slots; flow_schedule uses FLOW slots)
+                # Note: nv_fill only covers next A/B/C groups; D is handled separately via ALU
                 nv_fill_ops_for_hash = None
                 flow_schedule_for_hash = None
                 if software_nv_round and not is_last:
-                    # Within software_nv round: fill nv for next within-round triplet
+                    # Within software_nv round: fill nv for next within-round quadruplet (A/B/C only).
+                    # D's nv fill is done as a standalone bundle in the group D nav section below.
                     if is_level1_round:
                         nv_fill_ops_for_hash = [
                             ("multiply_add", nv_next_buf + j * VLEN,
@@ -849,8 +863,8 @@ class KernelBuilder:
                         for j in range(n_ng):
                             flow_schedule_for_hash[6 + j] = ("vselect", nv_next_buf + j * VLEN, mask_B_bufs[j], nv_lo_bufs[j], nv_hi_bufs[j])
                 elif is_last and next_is_software_nv:
-                    # Last triplet of round before software_nv round:
-                    # Pre-fill nv_A for next round's first triplet (packed into hash free slots).
+                    # Last quadruplet of round before software_nv round:
+                    # Pre-fill nv_A for next round's first quadruplet (A/B/C; D handled by ALU path).
                     if next_r == 11:  # next round is root
                         nv_fill_ops_for_hash = [
                             ("vbroadcast", self.nv_A + i * VLEN, nv_root_scalar)
@@ -863,7 +877,7 @@ class KernelBuilder:
                             for i, g in enumerate(first_groups)
                         ]
                     elif next_r == 2 or next_r == rounds - 3:  # next round is level2
-                        # mask_A for first_groups was pre-computed in nav-A of ti=n_triplets-2
+                        # mask_A for first_groups was pre-computed in nav-A of qi=n_quadruplets-2
                         n_fg = len(first_groups)
                         nv_fill_ops_for_hash = [
                             ("&", mask_B_bufs[j], idx_base + g * VLEN, v_one)
@@ -877,29 +891,39 @@ class KernelBuilder:
                             flow_schedule_for_hash[6 + j] = ("vselect", self.nv_A + j * VLEN, mask_B_bufs[j], nv_lo_bufs[j], nv_hi_bufs[j])
 
                 # FR3: XOR bundle handling.
-                # ti=0: standalone xor(ti=0) + addr_next(ti=1).
-                # ti>=1: xor folded into nav-C of ti-1. No standalone bundle.
-                # Spec 04: skip ti=0 xor if pre-applied by previous round's nav.
-                if ti == 0:
+                # qi=0: standalone xor(qi=0) + addr_next(qi=1).
+                # qi>=1: xor folded into nav-C of qi-1. No standalone bundle.
+                # Spec 04: skip qi=0 xor if pre-applied by previous round's nav.
+                if qi == 0:
                     if skip_ti0_xor:
                         # XOR, addr_next, and mask_A were already applied by previous round's
-                        # ti=10 nav-A/nav-B (fold optimization). Skip this entire bundle.
+                        # qi=7 nav-A/nav-B (fold optimization). Skip this entire bundle.
                         skip_ti0_xor = False
                     else:
+                        # XOR A/B/C groups via VALU; XOR group D and addr_next_D via ALU
                         xor_ops = [
                             ("^", val_base + g * VLEN, val_base + g * VLEN,
                              nv_cur + i * VLEN)
                             for i, g in enumerate(groups)
                         ]
+                        # Group D XOR via ALU (8 scalar ops, one per lane)
+                        xor_d_alu_ops = [
+                            ("^", val_base + d_g * VLEN + lane, val_base + d_g * VLEN + lane, nv_cur + 3 * VLEN + lane)
+                            for lane in range(VLEN)
+                        ]
                         # Spec 04: skip addr_next for software nv rounds (no scatter loads)
                         if software_nv_round:
                             addr_ops = []
+                            addr_d_alu_ops = []
                         else:
                             addr_ops = [
                                 ("+", self.addr_next + j * VLEN, v_fp,
                                  idx_base + ng * VLEN)
                                 for j, ng in enumerate(next_groups)
                             ]
+                            # Group D addr_next will be computed as VALU in nav_a (all 8 lanes).
+                            # The old ALU approach only set lane 0; VALU is required for correctness.
+                            addr_d_alu_ops = []
                         # Spec 04 level-2: pre-compute mask_A for next_groups before hash.
                         # xor bundle has 3 free VALU slots (software_nv_round → addr_ops=[]).
                         mask_A_pre = []
@@ -908,39 +932,55 @@ class KernelBuilder:
                                 ("<", mask_A_bufs[j], idx_base + ng * VLEN, v_five)
                                 for j, ng in enumerate(next_groups)
                             ]
+                            # D's mask_A (for level2) also via VALU (if room)
+                            if next_d_g_in_bounds and len(xor_ops + addr_ops + mask_A_pre) + 1 <= SLOT_LIMITS["valu"]:
+                                mask_A_pre = mask_A_pre + [("<", mask_A_bufs[3], idx_base + next_d_g * VLEN, v_five)]
                         xor_bundle_valu = xor_ops + addr_ops + mask_A_pre
+                        # Combine all ALU ops for xor_bundle
+                        xor_bundle_alu = xor_d_alu_ops + addr_d_alu_ops
+                        assert len(xor_bundle_valu) <= SLOT_LIMITS["valu"], f"xor_bundle VALU overflow: {len(xor_bundle_valu)} ops"
+                        assert len(xor_bundle_alu) <= SLOT_LIMITS["alu"], f"xor_bundle ALU overflow: {len(xor_bundle_alu)} ops"
                         # Optimization: merge xor bundle into preceding flow-only bundle (e.g., pause).
                         # The flow engine is independent of valu; the pause is a no-op with enable_pause=False.
-                        # This saves 1 cycle at the setup→main-loop boundary (round 0 ti=0 xor).
+                        # This saves 1 cycle at the setup→main-loop boundary (round 0 qi=0 xor).
+                        xor_bundle_dict = {"valu": xor_bundle_valu}
+                        if xor_bundle_alu:
+                            xor_bundle_dict["alu"] = xor_bundle_alu
                         if (self.instrs and list(self.instrs[-1].keys()) == ["flow"]
+                                and not xor_bundle_alu
                                 and len(xor_bundle_valu) <= SLOT_LIMITS["valu"]):
                             self.instrs[-1]["valu"] = xor_bundle_valu
                         else:
-                            self.instrs.append({"valu": xor_bundle_valu})
+                            self.instrs.append(xor_bundle_dict)
 
                 gi_list  = [idx_base + g * VLEN for g in groups]
                 gv_list  = [val_base + g * VLEN for g in groups]
                 tn_list  = [tmp_nav_slots[i] for i in range(len(groups))]
                 tvld_list = [tmp_vld_slots[i] for i in range(len(groups))]
 
-                # gi-doubler: compute gi = 2*gi + 1 for current triplet's groups.
+                # gi-doubler: compute gi = 2*gi + 1 for current quadruplet's A/B/C groups.
                 # Packed into a free valu cycle within the hash (3rd available slot after nav_d/nav_e).
+                # Group D's gi_doubler is emitted separately in the nav section (avoids 4+3=7>6 overflow).
                 # Spec 04 FR4: Skip gi_doubler in the last round (gi_next never used).
                 # Spec 04 FR3: Skip gi_doubler in wrap round (gi set directly to 0 in nav-A).
                 if is_last_round or is_wrap_round:
                     gi_doubler_ops = None
+                    gi_doubler_d_op = None
                 else:
                     gi_doubler_ops = [
                         ("multiply_add", gi_list[i], gi_list[i], v_two, v_one)
                         for i in range(len(groups))
                     ]
+                    # Group D's gi_doubler: emitted as standalone in nav section
+                    gi_doubler_d_op = ("multiply_add", idx_base + d_g * VLEN, idx_base + d_g * VLEN, v_two, v_one)
 
-                # Hash emission: pass deferred nav-D/E from PRIOR triplet to pack in even cycles,
-                # and gi_doubler_ops for CURRENT triplet's groups.
+                # Hash emission: pass deferred nav-D/E from PRIOR quadruplet to pack in even cycles,
+                # and gi_doubler_ops for CURRENT quadruplet's groups.
                 group_addrs = [
                     (val_base + g * VLEN, tmp1_slots[i], tmp2_slots[i])
                     for i, g in enumerate(groups)
                 ]
+                hash_start = len(self.instrs)  # record start for ALU overlay
                 extra_loads = []
                 if is_last:
                     # For non-last rounds: preload nv_A for round r+1's triplet 0.
@@ -969,12 +1009,30 @@ class KernelBuilder:
                         flow_schedule=flow_schedule_for_hash
                     )
 
-                # In the last round: enqueue store ops for current triplet's groups.
-                # val[g] is finalized after the hash (XOR happened in xor bundle before hash).
-                # Stores will be injected into nav bundles below using inject_stores().
+                # ── Spec 05: Group D ALU hash ──────────────────────────────────
+                # Compute 15 cycles of ALU ops for group D's hash.
+                # Inject ops[0..8] into hash cycles (fully parallel with VALU hash).
+                # ops[9..14] (6 remaining) stored for emission after nav.
+                alu_d_ops = self._emit_alu_hash_stages(
+                    (val_base + d_g * VLEN, self.tmp1_D, self.tmp2_D)
+                )
+                # Inject into already-emitted hash cycles
+                hash_end_pc = len(self.instrs)
+                n_hash_cycles_emitted = hash_end_pc - hash_start
+                for i in range(min(n_hash_cycles_emitted, len(alu_d_ops))):
+                    bundle = self.instrs[hash_start + i]
+                    if "alu" not in bundle:
+                        bundle["alu"] = alu_d_ops[i]
+                # Store remaining ALU ops for emission after nav
+                _remaining_alu_d = alu_d_ops[n_hash_cycles_emitted:]
+
+                # In the last round: enqueue store ops for current quadruplet's groups.
+                # A/B/C stores: finalized after VALU hash; inject early.
+                # D store: finalized only after ALL 15 ALU hash cycles complete; inject late.
                 if is_last_round:
                     for g in groups:
                         pending_stores.append(("vstore", addr_arr + g, val_base + g * VLEN))
+                    # D store is added AFTER remaining ALU ops are emitted (see below)
 
                 # ── Spec 04 FR4: Last round nav skip ──────────────────────────
                 # In the last round, gi_next is never used. Replace full nav with
@@ -1014,9 +1072,28 @@ class KernelBuilder:
                         if c2_bundle:
                             self.instrs.append(c2_bundle)
 
+                        # For non-software_nv overflow: load nv_next_buf[3] for group D BEFORE
+                        # addr_next2 (Cycle 3) overwrites addr_next[3].
+                        if not is_last and next_d_g_in_bounds and not software_nv_round:
+                            # First, set addr_next[3] = v_fp + idx[next_d_g] (all 8 lanes via VALU).
+                            # addr_next[3] was last set by the prologue (pointing to idx[3] for the
+                            # next-round's qi=0 D), so we must recompute it for next_d_g here.
+                            addr_d_lr_of_bundle = {"valu": [("+", self.addr_next + 3 * VLEN, v_fp, idx_base + next_d_g * VLEN)]}
+                            inject_stores(addr_d_lr_of_bundle, pending_stores)
+                            self.instrs.append(addr_d_lr_of_bundle)
+                            nv_d_next_base_of = nv_next_buf + 3 * VLEN
+                            addr_d_next_of = self.addr_next + 3 * VLEN
+                            for vi in range(0, VLEN, 2):
+                                ld_b = {"load": [
+                                    ("load_offset", nv_d_next_base_of, addr_d_next_of, vi),
+                                    ("load_offset", nv_d_next_base_of, addr_d_next_of, vi + 1),
+                                ]}
+                                inject_stores(ld_b, pending_stores)
+                                self.instrs.append(ld_b)
+
                         # Cycle 3: addr_next2 + extra_loads[2] + stores
-                        nn_a = (ti + 2) * 3
-                        next_next_groups = [g for g in [nn_a, nn_a+1, nn_a+2] if g < n_groups]
+                        nn_a = (qi + 2) * 4
+                        next_next_groups = [g for g in [nn_a, nn_a+1, nn_a+2, nn_a+3] if g < n_groups]
                         c3_valu = []
                         if next_next_groups:
                             c3_valu = [
@@ -1031,16 +1108,21 @@ class KernelBuilder:
                             inject_stores(c3_bundle, pending_stores)
                             if c3_bundle:
                                 self.instrs.append(c3_bundle)
-
                         # Cycle 4: deferred xor for last overflow group + stores
                         if deferred_xor_lr is not None:
                             j_def, ng_def = deferred_xor_lr
-                            dx_bundle = {"valu": [
-                                ("^", val_base + ng_def * VLEN, val_base + ng_def * VLEN,
-                                 nv_next_buf + j_def * VLEN)
-                            ]}
+                            dx_ops = [("^", val_base + ng_def * VLEN, val_base + ng_def * VLEN, nv_next_buf + j_def * VLEN)]
+                            # Also include D's XOR if in bounds
+                            if not is_last and next_d_g_in_bounds:
+                                dx_ops = dx_ops + [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]
+                            dx_bundle = {"valu": dx_ops}
                             inject_stores(dx_bundle, pending_stores)
                             self.instrs.append(dx_bundle)
+                        elif not is_last and next_d_g_in_bounds:
+                            # No deferred xor but still need D's XOR
+                            xor_d_bundle = {"valu": [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]}
+                            inject_stores(xor_d_bundle, pending_stores)
+                            self.instrs.append(xor_d_bundle)
                     else:
                         # No overflow: xor + extra_loads[1:] + addr_next2
                         if not is_last and len(next_groups) > 0:
@@ -1054,6 +1136,56 @@ class KernelBuilder:
                                 xor_bundle["load"] = extra_loads[1]
                             inject_stores(xor_bundle, pending_stores)
                             self.instrs.append(xor_bundle)
+                        # Prepare nv_next_buf[3] for group D XOR
+                        if not is_last and next_d_g_in_bounds:
+                            if software_nv_round:
+                                # Compute nv via software
+                                if is_level1_round:
+                                    nv_d_fill_lr = [("multiply_add", nv_next_buf + 3 * VLEN, idx_base + next_d_g * VLEN, v_nv_delta, v_nv_base)]
+                                elif is_root_round:
+                                    nv_d_fill_lr = [("vbroadcast", nv_next_buf + 3 * VLEN, nv_root_scalar)]
+                                elif is_level2_round:
+                                    nv_d_fill_lr = [("&", mask_B_bufs[3], idx_base + next_d_g * VLEN, v_one)]
+                                else:
+                                    nv_d_fill_lr = []
+                                if nv_d_fill_lr:
+                                    fill_bundle = {"valu": nv_d_fill_lr}
+                                    inject_stores(fill_bundle, pending_stores)
+                                    self.instrs.append(fill_bundle)
+                                if is_level2_round:
+                                    # mask_A_bufs[3] may not have been set for next_d_g yet
+                                    # (xor_bundle only sets it if there's room; emit it here explicitly).
+                                    mask_a_lr_d_bundle = {"valu": [("<", mask_A_bufs[3], idx_base + next_d_g * VLEN, v_five)]}
+                                    inject_stores(mask_a_lr_d_bundle, pending_stores)
+                                    self.instrs.append(mask_a_lr_d_bundle)
+                                    for op in [
+                                        ("vselect", nv_lo_bufs[3], mask_A_bufs[3], v_nv3, v_nv5),
+                                        ("vselect", nv_hi_bufs[3], mask_A_bufs[3], v_nv4, v_nv6),
+                                        ("vselect", nv_next_buf + 3 * VLEN, mask_B_bufs[3], nv_lo_bufs[3], nv_hi_bufs[3]),
+                                    ]:
+                                        self.instrs.append({"flow": [op]})
+                            else:
+                                # Load nv from scatter.
+                                # First, set addr_next[3] = v_fp + idx[next_d_g] (all 8 lanes via VALU).
+                                # addr_next[3] was last set by the prologue (pointing to idx[3] for the
+                                # next-round's qi=0 D), so we must recompute it for next_d_g here.
+                                addr_d_lr_bundle = {"valu": [("+", self.addr_next + 3 * VLEN, v_fp, idx_base + next_d_g * VLEN)]}
+                                inject_stores(addr_d_lr_bundle, pending_stores)
+                                self.instrs.append(addr_d_lr_bundle)
+                                nv_d_next_base_lr = nv_next_buf + 3 * VLEN
+                                addr_d_next_lr = self.addr_next + 3 * VLEN
+                                for vi in range(0, VLEN, 2):
+                                    ld_b = {"load": [
+                                        ("load_offset", nv_d_next_base_lr, addr_d_next_lr, vi),
+                                        ("load_offset", nv_d_next_base_lr, addr_d_next_lr, vi + 1),
+                                    ]}
+                                    inject_stores(ld_b, pending_stores)
+                                    self.instrs.append(ld_b)
+                        # XOR for group D (next_d_g) with nv_next_buf[3] — separate bundle
+                        if not is_last and next_d_g_in_bounds:
+                            xor_d_lr_bundle = {"valu": [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]}
+                            inject_stores(xor_d_lr_bundle, pending_stores)
+                            self.instrs.append(xor_d_lr_bundle)
 
                         # Remaining extra loads
                         for el in extra_loads[2:]:
@@ -1063,8 +1195,8 @@ class KernelBuilder:
 
                         # addr_next2
                         if not is_last:
-                            nn_a = (ti + 2) * 3
-                            next_next_groups = [g for g in [nn_a, nn_a+1, nn_a+2] if g < n_groups]
+                            nn_a = (qi + 2) * 4
+                            next_next_groups = [g for g in [nn_a, nn_a+1, nn_a+2, nn_a+3] if g < n_groups]
                             if next_next_groups:
                                 addr_ops = [
                                     ("+", self.addr_next + j * VLEN, v_fp,
@@ -1080,6 +1212,14 @@ class KernelBuilder:
                                 if st_bundle:
                                     self.instrs.append(st_bundle)
 
+                    # Emit remaining ALU ops for group D (last round: just run hash, no nav needed)
+                    for alu_cycle in _remaining_alu_d:
+                        alu_bundle = {"alu": alu_cycle}
+                        inject_stores(alu_bundle, pending_stores)
+                        self.instrs.append(alu_bundle)
+                    # Enqueue D store AFTER all remaining ALU cycles (val_D now final)
+                    pending_stores.append(("vstore", addr_arr + d_g, val_base + d_g * VLEN))
+
                     # Drain remaining stores
                     while pending_stores:
                         st_bundle = {}
@@ -1092,7 +1232,7 @@ class KernelBuilder:
                     # No nav-D/E deferred (last round)
                     prev_nav_d_bounds = []
                     prev_nav_e = []
-                    continue  # Skip gi doubling and bounds check
+                    continue  # Skip normal nav (last round: nav not needed for A/B/C or D)
 
                 # ── Navigation (gi-doubler in hash) ──
                 # gi-doubler in hash computes gi = 2*old_gi + 1.
@@ -1103,30 +1243,38 @@ class KernelBuilder:
                 # Extra loads for n_next=3: split across nav-A (vi=2,3), nav-B (vi=4,5),
                 #   nav-C (vi=6,7). Deferred_xor for group j goes into addr_next2 (AFTER nav-C
                 #   so vi=6,7 are committed).
+                nav_start_pc = len(self.instrs)
                 has_overflow = len(extra_loads) >= 3 and not is_last
 
                 # For overflow cases: n_xor_in_nav_c deferred xor
                 n_xor_in_nav_c = len(next_groups)
                 deferred_xor_group = None
+                deferred_prologue_addr_j2_overflow = None  # deferred when overflow hazard present
                 if has_overflow:
                     n_xor_in_nav_c = len(next_groups) - 1
                     deferred_xor_group = (len(next_groups) - 1, next_groups[-1])
 
                 # nav-A: tmp_nav = gv & v_one (reads hash output, must be after hash)
                 # FR3 (wrap round): directly set gi=0 via vbroadcast instead of &v_one + nav-D/E.
-                # For ti=n_triplets-2 in non-last rounds: fold prologue addr_next computation.
+                # For qi=n_quadruplets-2 in non-last rounds: fold prologue addr_next computation.
                 if is_wrap_round:
                     # FR3: all inputs wrap to gi=0; set directly, skip bounds check + multiply.
                     nav_a_ops = [("vbroadcast", gi_list[i], c0) for i in range(len(groups))]
                 else:
                     nav_a_ops = [("&", tn_list[i], gv_list[i], v_one) for i in range(len(groups))]
-                if ti == n_triplets - 2 and _r < rounds - 1:
+                if qi == n_quadruplets - 2 and _r < rounds - 1:
                     # Spec 04: skip prologue addr_next if next round uses software nv
                     if not next_is_software_nv:
                         prologue_addr_ops = [
                             ("+", self.addr_next + j * VLEN, v_fp, idx_base + ng * VLEN)
                             for j, ng in enumerate(first_groups)
                         ]
+                        # Hazard: when overflow, extra_loads[0..2] read addr_next[2] (j=2) in
+                        # nav-B and nav-C. Writing addr_next[2] in nav-A would corrupt those loads.
+                        # Defer the j=2 prologue addr_next to after extra_loads[2] completes.
+                        if has_overflow and len(prologue_addr_ops) > 2:
+                            deferred_prologue_addr_j2_overflow = prologue_addr_ops[2]
+                            prologue_addr_ops = prologue_addr_ops[:2] + prologue_addr_ops[3:]
                         nav_a_ops = nav_a_ops + prologue_addr_ops
                     elif next_r == 2 or next_r == rounds - 3:
                         # Spec 04 level-2: pre-compute mask_A for first_groups before last hash.
@@ -1135,20 +1283,20 @@ class KernelBuilder:
                             ("<", mask_A_bufs[j], idx_base + g * VLEN, v_five)
                             for j, g in enumerate(first_groups)
                         ]
-                # Spec 04 level-2: pre-compute mask_A for ti+2's groups (= ti+1's next_groups)
-                # in ti's nav-A, so they're ready before ti+1's hash starts.
-                # (ti=0's xor bundle already handles mask_A for ti=0's next_groups.)
+                # Spec 04 level-2: pre-compute mask_A for qi+2's groups (= qi+1's next_groups)
+                # in qi's nav-A, so they're ready before qi+1's hash starts.
+                # (qi=0's xor bundle already handles mask_A for qi=0's next_groups.)
                 if is_level2_round and not is_last:
-                    nn_a_future = (ti + 2) * 3
+                    nn_a_future = (qi + 2) * 4
                     future_groups_l2 = [g for g in [nn_a_future, nn_a_future + 1, nn_a_future + 2] if g < n_groups]
                     if future_groups_l2:
                         nav_a_ops = nav_a_ops + [
                             ("<", mask_A_bufs[j], idx_base + ng * VLEN, v_five)
                             for j, ng in enumerate(future_groups_l2)
                         ]
-                # Fold next round's ti=0 xor bundle: pre-compute addr_next or mask_A in nav-A.
-                # Applies only to ti=10 (is_last) of non-last rounds.
-                # This lets us skip the entire ti=0 xor bundle in the next round.
+                # Fold next round's qi=0 xor bundle: pre-compute addr_next or mask_A in nav-A.
+                # Applies only to qi=7 (is_last) of non-last rounds.
+                # This lets us skip the entire qi=0 xor bundle in the next round.
                 # IMPORTANT: Two hazards for addr_next slot j=2 (addr_next+16..23):
                 # 1. addr_next+16..23 must NOT be written in nav-A because extra_loads[1,2]
                 #    read addr_next+20..23 in nav-B and after; they must see OLD values.
@@ -1163,28 +1311,45 @@ class KernelBuilder:
                 # - nav-B: XOR for groups 0,1 only; extra_loads[1] in load slot
                 # - standalone extra_loads[2]: load nv_A[22,23]
                 # - deferred bundle: addr_next+16..23 for group 5 AND XOR for group 2
-                deferred_addr_next_j2 = None  # ("+", addr_next+2*VLEN, v_fp, idx_base+5*VLEN) if needed
+                deferred_addr_next_j2 = None  # ("+", addr_next+2*VLEN, v_fp, idx_base+6*VLEN) if needed
                 deferred_xor_g2 = None        # ("^", val_base+2*VLEN, val_base+2*VLEN, nv_A+2*VLEN) if needed
+                deferred_xor_d = None         # ("^", val_base+3*VLEN, val_base+3*VLEN, nv_A+3*VLEN) if needed
                 if is_last and _r < rounds - 1:
                     next_r_is_level2 = (next_r == 2 or next_r == rounds - 3)
                     if not next_is_software_nv:
-                        # Pre-compute addr_next for next round's ti=1 groups [3,4] in nav-A (safe).
-                        # Defer group 5 (j=2 → addr_next+16..23) to after all extra_loads complete,
+                        # Pre-compute addr_next for next round's qi=1 groups [4,5] in nav-A (safe).
+                        # Also pre-compute addr_next[3] for next round's qi=0 D group (group 3).
+                        # Defer group 6 (j=2 → addr_next+16..23) to after all extra_loads complete,
                         # to avoid overwriting addr_next+16..23 before extra_loads[1,2] use it.
                         nav_a_ops = nav_a_ops + [
                             ("+", self.addr_next + j * VLEN, v_fp, idx_base + ng * VLEN)
-                            for j, ng in enumerate([3, 4])   # only j=0,1
+                            for j, ng in enumerate([4, 5])   # only j=0,1
                         ]
-                        deferred_addr_next_j2 = ("+", self.addr_next + 2 * VLEN, v_fp, idx_base + 5 * VLEN)
-                        # Defer XOR for group 2 (nv_A[16..23] lanes 4-7 not loaded until after nav-B)
-                        if len(first_groups) > 2:
-                            deferred_xor_g2 = ("^", val_base + first_groups[2] * VLEN, val_base + first_groups[2] * VLEN, self.nv_A + 2 * VLEN)
+                        # Add addr_next[3] = v_fp + idx[3] for next round's D group (group 3).
+                        # This uses the 6th free VALU slot in nav-A (3 nav + 2 addr + 1 D addr).
+                        nav_a_ops = nav_a_ops + [("+", self.addr_next + 3 * VLEN, v_fp, idx_base + 3 * VLEN)]
+                        deferred_addr_next_j2 = ("+", self.addr_next + 2 * VLEN, v_fp, idx_base + 6 * VLEN)
+                        # k=4: XOR fold disabled (skip_ti0_xor is not used for k=4).
+                        # Group D XOR cannot be pre-applied here (nv_A[3*VLEN] not yet loaded).
+                        # All XORs (A/B/C/D) happen in the next round's qi=0 xor_bundle.
+                        # deferred_xor_g2 = None  (already None, keep disabled)
+                        # (group 3 XOR will happen in next round's qi=0 xor_bundle instead)
                     elif next_r_is_level2:
-                        # Pre-compute mask_A for next round's ti=0's next_groups [3,4,5]
+                        # Pre-compute mask_A for next round's qi=0's next_groups [4,5,6]
                         nav_a_ops = nav_a_ops + [
                             ("<", mask_A_bufs[j], idx_base + ng * VLEN, v_five)
-                            for j, ng in enumerate([3, 4, 5])
+                            for j, ng in enumerate([4, 5, 6])
                         ]
+                # For non-last, non-software_nv rounds: compute addr_next[3] = v_fp + idx[next_d_g]
+                # as VALU op (vector, all 8 lanes). The ALU-based computation in the xor_bundle
+                # only sets lane 0; VALU is required to set all 8 lanes correctly.
+                addr_d_next_valu_op = None
+                if not is_last and not software_nv_round and next_d_g_in_bounds:
+                    addr_d_next_valu_op = ("+", self.addr_next + 3 * VLEN, v_fp, idx_base + next_d_g * VLEN)
+                    if len(nav_a_ops) < SLOT_LIMITS["valu"]:
+                        # Room in nav_a: fold in here
+                        nav_a_ops = nav_a_ops + [addr_d_next_valu_op]
+                        addr_d_next_valu_op = None  # consumed; no standalone needed
                 nav_a_bundle = {"valu": nav_a_ops}
                 if len(extra_loads) > 0:
                     nav_a_bundle["load"] = extra_loads[0]
@@ -1192,6 +1357,12 @@ class KernelBuilder:
                 if not (is_wrap_round and not has_overflow):
                     inject_stores(nav_a_bundle, pending_stores)
                     self.instrs.append(nav_a_bundle)
+
+                # Emit standalone addr_next[3] VALU op if it didn't fit in nav_a.
+                if addr_d_next_valu_op is not None:
+                    addr_d_bundle = {"valu": [addr_d_next_valu_op]}
+                    inject_stores(addr_d_bundle, pending_stores)
+                    self.instrs.append(addr_d_bundle)
 
                 if has_overflow:
                     # 3-cycle nav (old nav-B style but gi already doubled):
@@ -1211,9 +1382,22 @@ class KernelBuilder:
                     inject_stores(nav_b_bundle, pending_stores)
                     self.instrs.append(nav_b_bundle)
 
+                    # Overflow: load nv for D of next quadruplet BEFORE nav-C overwrites addr_next[3].
+                    # addr_next[3] was set by xor_bundle ALU; nav_c addr_next2 will overwrite it.
+                    if not is_last and next_d_g_in_bounds and not software_nv_round:
+                        nv_d_next_base_of2 = nv_next_buf + 3 * VLEN
+                        addr_d_next_of2 = self.addr_next + 3 * VLEN
+                        for vi in range(0, VLEN, 2):
+                            ld_b2 = {"load": [
+                                ("load_offset", nv_d_next_base_of2, addr_d_next_of2, vi),
+                                ("load_offset", nv_d_next_base_of2, addr_d_next_of2, vi + 1),
+                            ]}
+                            inject_stores(ld_b2, pending_stores)
+                            self.instrs.append(ld_b2)
+
                     # nav-C: addr_next2_ops in valu + extra_loads[2] in load slot
-                    nn_a = (ti + 2) * 3
-                    next_next_groups = [g for g in [nn_a, nn_a+1, nn_a+2] if g < n_groups]
+                    nn_a = (qi + 2) * 4
+                    next_next_groups = [g for g in [nn_a, nn_a+1, nn_a+2, nn_a+3] if g < n_groups]
                     nav_c_valu_ops = []
                     # Spec 04: skip addr_next2 for software nv rounds
                     if next_next_groups and not software_nv_round:
@@ -1233,12 +1417,24 @@ class KernelBuilder:
                     # addr_next2 = deferred_xor (now standalone, after vi=6,7 committed in nav-C)
                     if deferred_xor_group is not None:
                         j_def, ng_def = deferred_xor_group
-                        dx_bundle = {"valu": [
+                        dx_valu = [
                             ("^", val_base + ng_def * VLEN, val_base + ng_def * VLEN,
                              nv_next_buf + j_def * VLEN)
-                        ]}
+                        ]
+                        # Also emit the deferred prologue addr_next[2] here (safe: extra_loads[2]
+                        # committed in nav-C, so addr_next[2] no longer needed for scatter loads).
+                        if deferred_prologue_addr_j2_overflow is not None:
+                            dx_valu = dx_valu + [deferred_prologue_addr_j2_overflow]
+                            deferred_prologue_addr_j2_overflow = None
+                        dx_bundle = {"valu": dx_valu}
                         inject_stores(dx_bundle, pending_stores)
                         self.instrs.append(dx_bundle)
+                    elif deferred_prologue_addr_j2_overflow is not None:
+                        # No deferred_xor_group but still need to emit the deferred prologue addr
+                        dp_bundle = {"valu": [deferred_prologue_addr_j2_overflow]}
+                        deferred_prologue_addr_j2_overflow = None
+                        inject_stores(dp_bundle, pending_stores)
+                        self.instrs.append(dp_bundle)
                 else:
                     # No overflow: nav-B (nav-A already emitted above, unless wrap merge)
                     # FR3: skip gi update for wrap round (gi already set to 0 in nav-A)
@@ -1250,18 +1446,10 @@ class KernelBuilder:
                             for j, ng in enumerate(next_groups)
                         ]
                         nav_b_ops = nav_b_ops + xor_next_ops
-                    # Fold next round's ti=0 xor into nav-B (only for ti=10 = is_last)
-                    # For group 2 (i=2): nv_A[16..23] lanes 4-7 are loaded in nav-B's load slot
-                    # (extra_loads[1]) and after, so the XOR for group 2 must be deferred.
-                    # Groups 0 and 1 are safe: their nv fully loaded before nav-B.
-                    if is_last and _r < rounds - 1:
-                        # Determine which groups can be XORed now (nv fully loaded)
-                        safe_xor_groups = [(i, g) for i, g in enumerate(first_groups) if deferred_xor_g2 is None or i < 2]
-                        nav_b_ops = nav_b_ops + [
-                            ("^", val_base + g * VLEN, val_base + g * VLEN,
-                             self.nv_A + i * VLEN)
-                            for i, g in safe_xor_groups
-                        ]
+                    # k=4: XOR fold disabled. For k=3 this would pre-apply qi=0 XOR here
+                    # and set skip_ti0_xor=True to skip it in the next round. For k=4,
+                    # group D XOR cannot be pre-applied (nv_A[3] not yet available here),
+                    # so we skip the fold entirely and let qi=0 xor_bundle handle all groups.
                     # For wrap round (non-overflow): merge deferred nav-A ops into nav-B if it fits.
                     # If merging would exceed SLOT_LIMITS["valu"], emit nav-A separately first.
                     extra_load_start = 0 if is_wrap_round else 1
@@ -1280,10 +1468,10 @@ class KernelBuilder:
                     nav_b_bundle = {"valu": nav_b_ops}
                     if len(extra_loads) > extra_load_start:
                         nav_b_bundle["load"] = extra_loads[extra_load_start]
-                    # At ti=n_triplets-2: pre-load vi=6,7 of nv_A group 2 into nav-B's free
+                    # At qi=n_quadruplets-2: pre-load vi=6,7 of nv_A group 2 into nav-B's free
                     # load slot. addr_next+2*VLEN was just computed in nav-A (prologue_addr_ops).
-                    # This eliminates the standalone load cycle at ti=n_triplets-1.
-                    elif (ti == n_triplets - 2 and _r < rounds - 1 and not next_is_software_nv):
+                    # This eliminates the standalone load cycle at qi=n_quadruplets-1.
+                    elif (qi == n_quadruplets - 2 and _r < rounds - 1 and not next_is_software_nv):
                         nav_b_bundle["load"] = [
                             ("load_offset", self.nv_A + 2 * VLEN, self.addr_next + 2 * VLEN, 6),
                             ("load_offset", self.nv_A + 2 * VLEN, self.addr_next + 2 * VLEN, 7),
@@ -1311,10 +1499,25 @@ class KernelBuilder:
                         inject_stores(deferred_bundle, pending_stores)
                         self.instrs.append(deferred_bundle)
 
-                    # For no-overflow non-last triplets: still need addr_next2 if next_next exists
+                    # For no-overflow non-last non-software_nv: load nv for D of next quadruplet
+                    # BEFORE addr_next2 overwrites addr_next[3].
+                    # addr_next[3] was set by xor_bundle ALU to v_fp + idx[next_d_g].
+                    # addr_next2 (below) will overwrite addr_next[3] with v_fp + idx[nn_d_g].
+                    if not is_last and next_d_g_in_bounds and not software_nv_round:
+                        nv_d_next_base_nof = nv_next_buf + 3 * VLEN
+                        addr_d_next_nof = self.addr_next + 3 * VLEN
+                        for vi in range(0, VLEN, 2):
+                            ld_b = {"load": [
+                                ("load_offset", nv_d_next_base_nof, addr_d_next_nof, vi),
+                                ("load_offset", nv_d_next_base_nof, addr_d_next_nof, vi + 1),
+                            ]}
+                            inject_stores(ld_b, pending_stores)
+                            self.instrs.append(ld_b)
+
+                    # For no-overflow non-last quadruplets: still need addr_next2 if next_next exists
                     if not is_last:
-                        nn_a = (ti + 2) * 3
-                        next_next_groups = [g for g in [nn_a, nn_a+1, nn_a+2] if g < n_groups]
+                        nn_a = (qi + 2) * 4
+                        next_next_groups = [g for g in [nn_a, nn_a+1, nn_a+2, nn_a+3] if g < n_groups]
                         # Spec 04: skip addr_next2 for software nv rounds
                         if next_next_groups and not software_nv_round:
                             addr_ops = [
@@ -1332,7 +1535,131 @@ class KernelBuilder:
                             if st_bundle:
                                 self.instrs.append(st_bundle)
 
-                # nav-D bounds: deferred to hi=0 even of ti+1's hash
+                # For last quadruplet of non-last non-software_nv round:
+                # load nv_A[3] for next round's qi=0 D group (group 3).
+                # addr_next[3] was set to v_fp + idx[3] in nav_a (above).
+                # addr_next2 is empty for is_last (qi=7), so addr_next[3] is still valid here.
+                if is_last and not is_last_round and not next_is_software_nv:
+                    nv_d_next_round_scatter_base = self.nv_A + 3 * VLEN
+                    addr_d_next_round = self.addr_next + 3 * VLEN
+                    for vi in range(0, VLEN, 2):
+                        ld_b_nr = {"load": [
+                            ("load_offset", nv_d_next_round_scatter_base, addr_d_next_round, vi),
+                            ("load_offset", nv_d_next_round_scatter_base, addr_d_next_round, vi + 1),
+                        ]}
+                        inject_stores(ld_b_nr, pending_stores)
+                        self.instrs.append(ld_b_nr)
+
+                # ── Group D: inject remaining ALU hash cycles into nav bundles ──
+                # Retroactively pack remaining ALU ops into already-emitted nav bundles
+                # (ALU slot is always empty in nav bundles — fully parallel execution).
+                # Mirrors the hash-phase injection pattern (hash_start above).
+                nav_end_pc = len(self.instrs)
+                n_nav_bundles = nav_end_pc - nav_start_pc
+                for i, alu_cycle in enumerate(_remaining_alu_d):
+                    if i < n_nav_bundles:
+                        bundle = self.instrs[nav_start_pc + i]
+                        if "alu" not in bundle:
+                            bundle["alu"] = alu_cycle
+                    else:
+                        alu_bundle = {"alu": alu_cycle}
+                        inject_stores(alu_bundle, pending_stores)
+                        self.instrs.append(alu_bundle)
+
+                # Group D navigation: nav_a_D and nav_b_D
+                # In wrap round: set gi_D = 0 directly
+                # In normal rounds: nav_a_D = val_D & v_one; nav_b_D = gi_D += nav_a_D
+                if is_wrap_round:
+                    nav_a_d_bundle = {"valu": [("vbroadcast", idx_base + d_g * VLEN, c0)]}
+                    inject_stores(nav_a_d_bundle, pending_stores)
+                    self.instrs.append(nav_a_d_bundle)
+                    # XOR D_next with nv_D_next
+                    if not is_last and next_d_g_in_bounds and not software_nv_round:
+                        xor_d_bundle = {"valu": [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]}
+                        inject_stores(xor_d_bundle, pending_stores)
+                        self.instrs.append(xor_d_bundle)
+                else:
+                    # nav_a_D: tmp_nav_D = val_D & 1 (reads hashed val_D, writes tmp_nav_D)
+                    # gi_doubler_d (if active): gi_D = 2*gi_D + 1 (independent of tmp_nav_D, safe to pack)
+                    nav_a_d_valu = [("&", tmp_nav_D, val_base + d_g * VLEN, v_one)]
+                    if gi_doubler_d_op is not None:
+                        nav_a_d_valu = nav_a_d_valu + [gi_doubler_d_op]
+                    nav_a_d_bundle = {"valu": nav_a_d_valu}
+                    inject_stores(nav_a_d_bundle, pending_stores)
+                    self.instrs.append(nav_a_d_bundle)
+                    nav_b_d_bundle = {"valu": [("+", idx_base + d_g * VLEN, idx_base + d_g * VLEN, tmp_nav_D)]}
+                    # XOR D_next with nv_D_next (if not software nv and not last)
+                    # nv_d_next_base is now fully loaded (4 load pairs above)
+                    if not is_last and next_d_g_in_bounds and not software_nv_round:
+                        nav_b_d_bundle["valu"] = nav_b_d_bundle["valu"] + [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]
+                    inject_stores(nav_b_d_bundle, pending_stores)
+                    self.instrs.append(nav_b_d_bundle)
+
+                # For last quadruplet of non-last round before a software_nv round:
+                # fill nv_A[3*VLEN] for next round's qi=0 group D.
+                # nv_fill_ops_for_hash only covers A/B/C (3 ops); D is handled here.
+                if is_last and not is_last_round and next_is_software_nv:
+                    # group 3 is the D group of qi=0 in the next round
+                    d_nv_next_round_group = 3  # = 0*4 + 3
+                    if next_r == 11:  # next round is root
+                        nv_d_next_round_fill = [("vbroadcast", self.nv_A + 3 * VLEN, nv_root_scalar)]
+                    elif next_r == 1 or next_r == rounds - 4:  # next round is level1
+                        nv_d_next_round_fill = [("multiply_add", self.nv_A + 3 * VLEN,
+                                                 idx_base + d_nv_next_round_group * VLEN,
+                                                 v_nv_delta, v_nv_base)]
+                    elif next_r == 2 or next_r == rounds - 3:  # next round is level2
+                        nv_d_next_round_fill = [("&", mask_B_bufs[3],
+                                                 idx_base + d_nv_next_round_group * VLEN, v_one)]
+                    else:
+                        nv_d_next_round_fill = []
+                    if nv_d_next_round_fill:
+                        nv_d_nr_bundle = {"valu": nv_d_next_round_fill}
+                        inject_stores(nv_d_nr_bundle, pending_stores)
+                        self.instrs.append(nv_d_nr_bundle)
+                    if (next_r == 2 or next_r == rounds - 3):  # level2 FLOW vselect for D
+                        # mask_A_bufs[3] must be computed here (not precomputed like A/B/C groups).
+                        # idx[g3] = gi for group 3, now finalized after nav_b_d.
+                        mask_a_d_bundle = {"valu": [("<", mask_A_bufs[3], idx_base + d_nv_next_round_group * VLEN, v_five)]}
+                        inject_stores(mask_a_d_bundle, pending_stores)
+                        self.instrs.append(mask_a_d_bundle)
+                        self.instrs.append({"flow": [("vselect", nv_lo_bufs[3], mask_A_bufs[3], v_nv3, v_nv5)]})
+                        self.instrs.append({"flow": [("vselect", nv_hi_bufs[3], mask_A_bufs[3], v_nv4, v_nv6)]})
+                        self.instrs.append({"flow": [("vselect", self.nv_A + 3 * VLEN, mask_B_bufs[3], nv_lo_bufs[3], nv_hi_bufs[3])]})
+
+                # For software_nv rounds: fill nv_next_buf[3] for group D, then XOR.
+                if software_nv_round and not is_last and next_d_g_in_bounds:
+                    if is_level1_round:
+                        nv_d_fill = [("multiply_add", nv_next_buf + 3 * VLEN, idx_base + next_d_g * VLEN, v_nv_delta, v_nv_base)]
+                    elif is_root_round:
+                        nv_d_fill = [("vbroadcast", nv_next_buf + 3 * VLEN, nv_root_scalar)]
+                    elif is_level2_round:
+                        nv_d_fill = [("&", mask_B_bufs[3], idx_base + next_d_g * VLEN, v_one)]
+                    else:
+                        nv_d_fill = []
+                    if nv_d_fill:
+                        nv_d_bundle = {"valu": nv_d_fill}
+                        inject_stores(nv_d_bundle, pending_stores)
+                        self.instrs.append(nv_d_bundle)
+                    # For level2: also need FLOW vselect to get nv from nv_lo/hi
+                    if is_level2_round:
+                        # mask_A_bufs[3] may be stale (xor_bundle only adds it if room).
+                        # Explicitly compute it here (idx[next_d_g] < 5) before FLOW vselects.
+                        mask_a_svnv_d_bundle = {"valu": [("<", mask_A_bufs[3], idx_base + next_d_g * VLEN, v_five)]}
+                        inject_stores(mask_a_svnv_d_bundle, pending_stores)
+                        self.instrs.append(mask_a_svnv_d_bundle)
+                        # Emit FLOW cycles for D's nv computation
+                        flow_d_lo = {"flow": [("vselect", nv_lo_bufs[3], mask_A_bufs[3], v_nv3, v_nv5)]}
+                        self.instrs.append(flow_d_lo)
+                        flow_d_hi = {"flow": [("vselect", nv_hi_bufs[3], mask_A_bufs[3], v_nv4, v_nv6)]}
+                        self.instrs.append(flow_d_hi)
+                        flow_d_final = {"flow": [("vselect", nv_next_buf + 3 * VLEN, mask_B_bufs[3], nv_lo_bufs[3], nv_hi_bufs[3])]}
+                        self.instrs.append(flow_d_final)
+                    # XOR D_next with its software-computed nv
+                    xor_d_bundle = {"valu": [("^", val_base + next_d_g * VLEN, val_base + next_d_g * VLEN, nv_next_buf + 3 * VLEN)]}
+                    inject_stores(xor_d_bundle, pending_stores)
+                    self.instrs.append(xor_d_bundle)
+
+                # nav-D bounds: deferred to hi=0 even of qi+1's hash
                 # FR3: gi=0 is already correct (all wrap); skip bounds check and multiply.
                 if is_wrap_round:
                     curr_nav_d_bounds = []
@@ -1341,22 +1668,22 @@ class KernelBuilder:
                     curr_nav_d_bounds = [
                         ("<", tvld_list[i], gi_list[i], v_nnodes) for i in range(len(groups))
                     ]
-                    # nav-E: deferred to hi=1 even of ti+1's hash
+                    # nav-E: deferred to hi=1 even of qi+1's hash
                     curr_nav_e = [
                         ("*", gi_list[i], gi_list[i], tvld_list[i]) for i in range(len(groups))
                     ]
 
                 if is_last and _r == rounds - 1:
-                    # Last triplet of last round: idx is not checked by tests,
+                    # Last quadruplet of last round: idx is not checked by tests,
                     # so skip nav-D/E (saves 2 cycles per kernel run).
                     prev_nav_d_bounds = []
                     prev_nav_e = []
                 elif is_last:
-                    # Last triplet but not last round: defer nav-D/E into next round's ti=0 hash.
-                    # Also signal that next round's ti=0 xor bundle was pre-applied (fold opt).
+                    # Last quadruplet but not last round: defer nav-D/E into next round's qi=0 hash.
+                    # Note: skip_ti0_xor optimization disabled for k=4 (group D XOR not pre-applied).
                     prev_nav_d_bounds = curr_nav_d_bounds
                     prev_nav_e = curr_nav_e
-                    skip_ti0_xor = True
+                    # skip_ti0_xor = True  # Disabled for k=4: group D XOR needs xor_bundle
                 else:
                     prev_nav_d_bounds = curr_nav_d_bounds
                     prev_nav_e = curr_nav_e
