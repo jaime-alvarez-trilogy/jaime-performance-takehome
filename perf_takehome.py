@@ -63,13 +63,13 @@ class ScratchLayout:
     val_bases: list        # val_bases[i] = val_base + group_ids[i] * VLEN
     idx_bases: list        # idx_bases[i] = idx_base + group_ids[i] * VLEN
 
-    NV_OFF   = 0     # nv_buf:   8 words
-    TMP1_OFF = 8     # tmp1:     8 words
-    TMP2_OFF = 16    # tmp2:     8 words
-    ADDR_OFF = 24    # addr_buf: 8 words
-    TNAV_OFF = 32    # tmp_nav:  8 words
-    TVLD_OFF = 40    # tmp_vld:  8 words
-    WORDS_PER_CTX = 48   # 6 × 8 words per context
+    NV_OFF   = 0     # nv_buf:         8 words  [independent]
+    TMP1_OFF = 8     # tmp1 + tmp_nav: 8 words  [aliased — sequential use]
+    TMP2_OFF = 16    # tmp2 + addr_buf + tmp_vld: 8 words  [aliased — sequential use]
+    ADDR_OFF = 16    # same as TMP2_OFF
+    TNAV_OFF = 8     # same as TMP1_OFF
+    TVLD_OFF = 16    # same as TMP2_OFF
+    WORDS_PER_CTX = 24   # 3 × 8 words per context
 
     def nv_buf(self, ctx):   return self.context_bases[ctx] + ScratchLayout.NV_OFF
     def tmp1(self, ctx):     return self.context_bases[ctx] + ScratchLayout.TMP1_OFF
@@ -554,27 +554,6 @@ def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nno
                     ctx_ops.append(op_nav_b)
                     s += 1
 
-                    # Nav bounds: tmp_vld = idx_buf < v_nnodes
-                    op_nav_c = Op(
-                        engine='valu',
-                        instr=('<', tmp_vld, idx_buf, v_nnodes),
-                        dst=tmp_vld,
-                        dep_srcs=[idx_buf, v_nnodes],
-                        context_id=ctx, round_id=r, stage=s,
-                    )
-                    ctx_ops.append(op_nav_c)
-                    s += 1
-
-                    # Nav multiply: idx_buf *= tmp_vld (wraps OOB indices to 0)
-                    op_nav_d = Op(
-                        engine='valu',
-                        instr=('*', idx_buf, idx_buf, tmp_vld),
-                        dst=idx_buf,
-                        dep_srcs=[idx_buf, tmp_vld],
-                        context_id=ctx, round_id=r, stage=s,
-                    )
-                    ctx_ops.append(op_nav_d)
-                    s += 1
 
         # ── Populate deps via last-writer analysis ───────────────────────────
         # Process ops in round/stage order; track last writer per scratch addr
@@ -1359,7 +1338,7 @@ class KernelBuilder:
         # ── Spec 06: DAG-based multi-context scheduler ────────────────────────
         # Replace hand-scheduled quadruplet loop with greedy list scheduler.
         # group_size=16: 16 contexts × 48 words = 768 words; dag_base ~697, 697+768=1465 ≤ 1536.
-        group_size = 16
+        group_size = 32
         dag_base_offset = self.scratch_ptr
         assert dag_base_offset + group_size * ScratchLayout.WORDS_PER_CTX <= SCRATCH_SIZE, (
             f"DAG scratch overflow: need {dag_base_offset + group_size * ScratchLayout.WORDS_PER_CTX}, "
@@ -1401,21 +1380,50 @@ class KernelBuilder:
                 v_nv5=v_nv[5],
                 v_nv6=v_nv[6],
             )
+            # ── Store integration: add vstore ops into the DAG ────────────────
+            # Build set of all val_buf lane addresses across all contexts.
+            # VALU hash writes dst=val_buf (base); ALU hash writes dst=val_buf+i (per-lane).
+            # Track last writer per lane address so stores depend on ALL lane writes.
+            val_buf_addrs = set()
+            for ctx in range(n_ctx):
+                vb = pass_layout.val_buf(ctx)
+                for i in range(VLEN):
+                    val_buf_addrs.add(vb + i)
+            last_val_writer = {}  # addr → Op (last writer of that lane address)
+            for op in ops:
+                if op.dst in val_buf_addrs:
+                    addr = op.dst
+                    if addr not in last_val_writer or (
+                        op.round_id > last_val_writer[addr].round_id or (
+                            op.round_id == last_val_writer[addr].round_id and
+                            op.stage >= last_val_writer[addr].stage
+                        )
+                    ):
+                        last_val_writer[addr] = op
+            for ctx in range(n_ctx):
+                g = pass_groups[ctx]
+                vb_addr = pass_layout.val_buf(ctx)
+                store_op = Op(
+                    engine='store',
+                    instr=('vstore', addr_arr + g, vb_addr),
+                    dst=-1,
+                    dep_srcs=[vb_addr],
+                    context_id=ctx,
+                    round_id=rounds - 1,
+                    stage=9999,
+                )
+                # Depend on the last writer of every lane (val_buf+0 .. val_buf+VLEN-1).
+                seen_writers = set()
+                for i in range(VLEN):
+                    writer = last_val_writer.get(vb_addr + i)
+                    if writer is not None and id(writer) not in seen_writers:
+                        store_op.deps.append(writer)
+                        seen_writers.add(id(writer))
+                ops.append(store_op)
             schedule = list_schedule(ops)
             for bundle in schedule:
                 if not bundle.is_empty():
                     self.instrs.append(bundle.to_instr_dict())
-
-        # ── Store final val back to memory ─────────────────────────────────────
-        STORE_LIMIT = SLOT_LIMITS["store"]
-        pending_stores = [
-            ("vstore", addr_arr + g, val_base + g * VLEN)
-            for g in range(n_groups)
-        ]
-        while pending_stores:
-            take = min(STORE_LIMIT, len(pending_stores))
-            store_ops = [pending_stores.pop(0) for _ in range(take)]
-            self.instrs.append({"store": store_ops})
 
         # No final pause: machine stops when pc >= len(program). pause costs 1 cycle.
 
