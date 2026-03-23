@@ -1259,6 +1259,13 @@ class KernelBuilder:
         for i in range(0, len(idx_vbroadcasts), VALU_LIMIT):
             idx_vb_batches.append(idx_vbroadcasts[i:i + VALU_LIMIT])
 
+        # Pre-allocate nv scratch so add_imm ops can be woven into the idle FLOW
+        # slots of the remaining val-vload phase below (saves 6 standalone cycles).
+        fvp = self.scratch["forest_values_p"]
+        s_nv = [self.alloc_scratch(f"s_nv{i}") for i in range(7)]   # 7 scalar slots
+        v_nv = [self.alloc_scratch(f"v_nv{i}", VLEN) for i in range(7)]  # 7 × VLEN = 56
+        _nv_add_imm_ops = [("add_imm", s_nv[i], fvp, i) for i in range(1, 7)]
+
         # Val phase: compute addr_arr for val addresses, then vload.
         val_alu_batches = make_idx_alu_batches(self.scratch["inp_values_p"])
         # Emit val ALU batch 0 (pure ALU, no overlap)
@@ -1280,8 +1287,10 @@ class KernelBuilder:
                 vb_idx += 1
             self.instrs.append(bundle)
 
-        # Remaining vload pairs overlapped with idx vbroadcasts
-        while vl_idx < len(val_vload_pairs) or vb_idx < len(idx_vb_batches):
+        # Remaining vload pairs overlapped with idx vbroadcasts and nv add_imm ops.
+        # FLOW is idle in these cycles; absorb all 6 add_imm ops here (saves 6 cycles).
+        _nv_ai_idx = 0
+        while vl_idx < len(val_vload_pairs) or vb_idx < len(idx_vb_batches) or _nv_ai_idx < len(_nv_add_imm_ops):
             bundle = {}
             if vl_idx < len(val_vload_pairs):
                 bundle["load"] = val_vload_pairs[vl_idx]
@@ -1289,6 +1298,9 @@ class KernelBuilder:
             if vb_idx < len(idx_vb_batches):
                 bundle["valu"] = idx_vb_batches[vb_idx]
                 vb_idx += 1
+            if _nv_ai_idx < len(_nv_add_imm_ops):
+                bundle["flow"] = [_nv_add_imm_ops[_nv_ai_idx]]
+                _nv_ai_idx += 1
             if bundle:
                 self.instrs.append(bundle)
 
@@ -1307,13 +1319,8 @@ class KernelBuilder:
         # We reuse s_nv[1..6] as address buffers first, then overwrite with values.
         # Step 1: add_imm(s_nv[i], fvp, i) → s_nv[i] = scratch[fvp] + i = fp+i
         # Step 2: load(s_nv[i], s_nv[i])   → s_nv[i] = mem[fp+i] = node_val[i]
-        fvp = self.scratch["forest_values_p"]
-        s_nv = [self.alloc_scratch(f"s_nv{i}") for i in range(7)]   # 7 scalar slots
-        v_nv = [self.alloc_scratch(f"v_nv{i}", VLEN) for i in range(7)]  # 7 × VLEN = 56
-
-        # Step 1: compute forest_values_p + i into s_nv[1..6] via flow add_imm (1/cycle).
-        for i in range(1, 7):
-            self.instrs.append({"flow": [("add_imm", s_nv[i], fvp, i)]})
+        # fvp, s_nv, v_nv allocated above (before val loading phase).
+        # add_imm ops overlapped into val vload phase above (saves 6 cycles).
 
         # Step 2: load node_val[0..6] from forest memory.
         # node_val[0]: load(s_nv[0], fvp)      → mem[scratch[fvp]]      = mem[fp]
@@ -1332,8 +1339,6 @@ class KernelBuilder:
 
         # Alias for build_op_graph dispatch
         v_nv_root = v_nv[0]   # rounds 0, 10, 11
-
-        self.add("flow", ("pause",))
 
         # ── Spec 06: DAG-based multi-context scheduler ────────────────────────
         # Replace hand-scheduled quadruplet loop with greedy list scheduler.
