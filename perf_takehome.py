@@ -125,11 +125,12 @@ class Bundle:
         return result
 
 
-def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nnodes,
+def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nnodes=None,
                    context_types=None, const_map=None,
                    v_nv_root=None, v_nv_delta=None, v_nv_base=None,
                    v_nv1=None, v_nv2=None, v_nv3=None, v_nv4=None,
-                   v_nv5=None, v_nv6=None):
+                   v_nv5=None, v_nv6=None,
+                   v_diff_T=None, v_diff_F=None):
     """
     Generate all Ops for a set of contexts/rounds with populated deps.
 
@@ -270,24 +271,24 @@ def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nno
                 )
                 ctx_ops.append(op_b1)
                 s += 1
-                # Step 3: nv_bit1_T = vselect(lo_bit, v_nv3, v_nv6)  →  nv_buf  (FLOW)
-                # When bit1≠0: lo=1→nv3, lo=0→nv6
+                # Step 3: nv_bit1_T = multiply_add(lo_bit, diff_T, v_nv6) → nv_buf (VALU)
+                # = lo_bit*(v_nv3-v_nv6)+v_nv6; lo_bit∈{0,1} so: 1→v_nv3, 0→v_nv6
                 op_nv_t = Op(
-                    engine='flow',
-                    instr=('vselect', nv_buf, tmp1, v_nv3, v_nv6),
+                    engine='valu',
+                    instr=('multiply_add', nv_buf, tmp1, v_diff_T, v_nv6),
                     dst=nv_buf,
-                    dep_srcs=[tmp1, v_nv3, v_nv6],
+                    dep_srcs=[tmp1, v_diff_T, v_nv6],
                     context_id=ctx, round_id=r, stage=s,
                 )
                 ctx_ops.append(op_nv_t)
                 s += 1
-                # Step 4: nv_bit1_F = vselect(lo_bit, v_nv5, v_nv4)  →  tmp_nav  (FLOW)
-                # When bit1=0: lo=1→nv5, lo=0→nv4
+                # Step 4: nv_bit1_F = multiply_add(lo_bit, diff_F, v_nv4) → tmp_nav (VALU)
+                # = lo_bit*(v_nv5-v_nv4)+v_nv4; lo_bit∈{0,1} so: 1→v_nv5, 0→v_nv4
                 op_nv_f = Op(
-                    engine='flow',
-                    instr=('vselect', tmp_nav, tmp1, v_nv5, v_nv4),
+                    engine='valu',
+                    instr=('multiply_add', tmp_nav, tmp1, v_diff_F, v_nv4),
                     dst=tmp_nav,
-                    dep_srcs=[tmp1, v_nv5, v_nv4],
+                    dep_srcs=[tmp1, v_diff_F, v_nv4],
                     context_id=ctx, round_id=r, stage=s,
                 )
                 ctx_ops.append(op_nv_f)
@@ -1088,12 +1089,12 @@ class KernelBuilder:
         c0 = self.scratch_const(0, "c0")
         c1 = self.scratch_const(1, "c1")
         c2 = self.scratch_const(2, "c2")
-        c_nn = self.scratch_const(n_nodes, "c_nnodes")
+        # c_nn / v_nnodes removed: nav_c/nav_d dead-code elimination made them unused.
+        # Frees 9 scratch words (1 scalar + 8 vector) for Level2 FLOW→VALU constants.
 
         # ── Vector constants (broadcast once, reused every cycle) ─────────────
         v_one    = self.alloc_scratch("v_one",    VLEN)
         v_two    = self.alloc_scratch("v_two",    VLEN)  # for gi-doubler: gi = 2*gi + 1
-        v_nnodes = self.alloc_scratch("v_nnodes", VLEN)
         v_fp     = self.alloc_scratch("v_fp",     VLEN)  # forest_values_p as vector
 
         # Hash stage vector constants
@@ -1143,7 +1144,6 @@ class KernelBuilder:
         all_broadcasts = [
             ("vbroadcast", v_one,    c1),
             ("vbroadcast", v_two,    c2),
-            ("vbroadcast", v_nnodes, c_nn),
             ("vbroadcast", v_fp,     self.scratch["forest_values_p"]),
         ] + [
             ("vbroadcast", hvc[val], self.const_map[val])
@@ -1340,6 +1340,16 @@ class KernelBuilder:
         # Alias for build_op_graph dispatch
         v_nv_root = v_nv[0]   # rounds 0, 10, 11
 
+        # Level2 FLOW→VALU: pre-compute diff vectors so multiply_add replaces 2 vselects.
+        # multiply_add(dst, lo_bit, diff, base) = lo_bit*(nv_T-nv_F) + nv_F
+        # = nv_T when lo_bit=1, nv_F when lo_bit=0 (since lo_bit ∈ {0,1} from &1).
+        v_diff_T = self.alloc_scratch("v_diff_T", VLEN)  # v_nv3 - v_nv6 (step 3 diff)
+        v_diff_F = self.alloc_scratch("v_diff_F", VLEN)  # v_nv5 - v_nv4 (step 4 diff)
+        self.instrs.append({"valu": [
+            ('-', v_diff_T, v_nv[3], v_nv[6]),
+            ('-', v_diff_F, v_nv[5], v_nv[4]),
+        ]})
+
         # ── Spec 06: DAG-based multi-context scheduler ────────────────────────
         # Replace hand-scheduled quadruplet loop with greedy list scheduler.
         # group_size=16: 16 contexts × 48 words = 768 words; dag_base ~697, 697+768=1465 ≤ 1536.
@@ -1374,7 +1384,6 @@ class KernelBuilder:
                 v_fp=v_fp,
                 v_one=v_one,
                 v_two=v_two,
-                v_nnodes=v_nnodes,
                 context_types=context_types,
                 const_map=self.const_map,
                 v_nv_root=v_nv_root,
@@ -1384,6 +1393,8 @@ class KernelBuilder:
                 v_nv4=v_nv[4],
                 v_nv5=v_nv[5],
                 v_nv6=v_nv[6],
+                v_diff_T=v_diff_T,
+                v_diff_F=v_diff_F,
             )
             # ── Store integration: add vstore ops into the DAG ────────────────
             # Build set of all val_buf lane addresses across all contexts.
