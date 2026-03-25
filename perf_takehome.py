@@ -69,7 +69,8 @@ class ScratchLayout:
     ADDR_OFF = 16    # same as TMP2_OFF
     TNAV_OFF = 8     # same as TMP1_OFF
     TVLD_OFF = 16    # same as TMP2_OFF
-    WORDS_PER_CTX = 24   # 3 × 8 words per context
+    TMP3_OFF = 24    # tmp3: 8 words  [level3 only — 4th VLEN region]
+    WORDS_PER_CTX = 32   # 4 × 8 words per context (tmp3 added for level3)
 
     def nv_buf(self, ctx):   return self.context_bases[ctx] + ScratchLayout.NV_OFF
     def tmp1(self, ctx):     return self.context_bases[ctx] + ScratchLayout.TMP1_OFF
@@ -77,6 +78,7 @@ class ScratchLayout:
     def addr_buf(self, ctx): return self.context_bases[ctx] + ScratchLayout.ADDR_OFF
     def tmp_nav(self, ctx):  return self.context_bases[ctx] + ScratchLayout.TNAV_OFF
     def tmp_vld(self, ctx):  return self.context_bases[ctx] + ScratchLayout.TVLD_OFF
+    def tmp3(self, ctx):     return self.context_bases[ctx] + ScratchLayout.TMP3_OFF
     def val_buf(self, ctx):  return self.val_bases[ctx]
     def idx_buf(self, ctx):  return self.idx_bases[ctx]
 
@@ -130,7 +132,10 @@ def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nno
                    v_nv_root=None, v_nv_delta=None, v_nv_base=None,
                    v_nv1=None, v_nv2=None, v_nv3=None, v_nv4=None,
                    v_nv5=None, v_nv6=None,
-                   v_diff_T=None, v_diff_F=None):
+                   v_diff_T=None, v_diff_F=None,
+                   v_seven=None,
+                   v_nv7=None, v_nv9=None, v_nv11=None, v_nv13=None,
+                   v_d3_A00=None, v_d3_A01=None, v_d3_A10=None, v_d3_A11=None):
     """
     Generate all Ops for a set of contexts/rounds with populated deps.
 
@@ -303,6 +308,122 @@ def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nno
                     context_id=ctx, round_id=r, stage=s,
                 )
                 ctx_ops.append(op_nv_sel)
+                s += 1
+            elif rc == 'level3':
+                # Depth-3 nodes (rounds 3, 14): replace 8 scatter loads with 13-op selection.
+                # idx_buf ∈ [7..14]; path = idx-7 ∈ [0..7]; bits: b0=path&1, b1=(path>>1)&1, b2=path>>2
+                # 3-level binary mux tree via multiply_add + FLOW vselect.
+                # Registers: nv_buf(0), tmp1(8), tmp2/addr_buf(16), tmp3(24 NEW)
+                t3 = scratch.tmp3(ctx)
+
+                # op1: t1 = idx_buf - v_seven  (path ∈ [0..7])
+                op_path = Op(
+                    engine='valu', instr=('-', tmp1, idx_buf, v_seven),
+                    dst=tmp1, dep_srcs=[idx_buf, v_seven],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_path)
+                s += 1
+
+                # op2+op3 (same stage): b0 = path & v_one → tmp2;  bit1_raw = path & v_two → t3
+                op_b0 = Op(
+                    engine='valu', instr=('&', tmp2, tmp1, v_one),
+                    dst=tmp2, dep_srcs=[tmp1, v_one],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                op_b1r = Op(
+                    engine='valu', instr=('&', t3, tmp1, v_two),
+                    dst=t3, dep_srcs=[tmp1, v_two],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_b0)
+                ctx_ops.append(op_b1r)
+                s += 1
+
+                # op4+op5: A_00 = b0*(nv8-nv7)+nv7 → tmp1;  A_01 = b0*(nv10-nv9)+nv9 → nv_buf
+                # IMPORTANT: op_A00 writes tmp1 (overwriting path). op_b1r reads tmp1 (path).
+                # Force op_b1r before op_A00 by adding t3 to dep_srcs
+                # (last_writer[t3]=op_b1r → op_A00 waits for op_b1r to finish reading path).
+                op_A00 = Op(
+                    engine='valu', instr=('multiply_add', tmp1, tmp2, v_d3_A00, v_nv7),
+                    dst=tmp1, dep_srcs=[t3, tmp2, v_d3_A00, v_nv7],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                op_A01 = Op(
+                    engine='valu', instr=('multiply_add', nv_buf, tmp2, v_d3_A01, v_nv9),
+                    dst=nv_buf, dep_srcs=[tmp2, v_d3_A01, v_nv9],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_A00)
+                ctx_ops.append(op_A01)
+                s += 1
+
+                # FLOW: nv_buf = bit1_raw ? A_01 : A_00  → B_0
+                op_B0 = Op(
+                    engine='flow', instr=('vselect', nv_buf, t3, nv_buf, tmp1),
+                    dst=nv_buf, dep_srcs=[t3, nv_buf, tmp1],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_B0)
+                s += 1
+
+                # op7+op8: A_10 = b0*(nv12-nv11)+nv11 → tmp1;  A_11 = b0*(nv14-nv13)+nv13 → tmp2
+                # IMPORTANT: op_A11 reads AND writes tmp2. If it ran before op_A10, op_A10 would
+                # read A_11 instead of b0. Force op_A11 after op_A10 by listing tmp1 in dep_srcs
+                # (last_writer[tmp1] = op_A10 → op_A11 scheduled after op_A10 completes).
+                # IMPORTANT: op_A10 writes tmp1, overwriting A_00 which op_B0 still needs.
+                # Force Phase 1 (A_00 → B_0) to complete before Phase 2 (A_10 → B_1) starts
+                # by adding nv_buf to dep_srcs: last_writer[nv_buf]=op_B0 → op_A10 after op_B0.
+                # This also implies op_A10 is after op_b1r (since op_B0 is after op_b1r). ✓
+                op_A10 = Op(
+                    engine='valu', instr=('multiply_add', tmp1, tmp2, v_d3_A10, v_nv11),
+                    dst=tmp1, dep_srcs=[nv_buf, tmp2, v_d3_A10, v_nv11],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                op_A11 = Op(
+                    engine='valu', instr=('multiply_add', tmp2, tmp2, v_d3_A11, v_nv13),
+                    dst=tmp2, dep_srcs=[tmp1, tmp2, v_d3_A11, v_nv13],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_A10)
+                ctx_ops.append(op_A11)
+                s += 1
+
+                # FLOW: tmp1 = bit1_raw ? A_11 : A_10  → B_1
+                op_B1 = Op(
+                    engine='flow', instr=('vselect', tmp1, t3, tmp2, tmp1),
+                    dst=tmp1, dep_srcs=[t3, tmp2, tmp1],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_B1)
+                s += 1
+
+                # Re-extract b2 = (idx-7) >> 2  (tmp2 free after B_1 is done)
+                # IMPORTANT: op_path2 writes tmp2; op_B1 reads tmp2 (A_11). Force op_B1 first
+                # by adding tmp1 to dep_srcs (last_writer[tmp1]=op_B1 → waits for op_B1 done).
+                op_path2 = Op(
+                    engine='valu', instr=('-', tmp2, idx_buf, v_seven),
+                    dst=tmp2, dep_srcs=[idx_buf, v_seven, tmp1],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_path2)
+                s += 1
+
+                op_b2 = Op(
+                    engine='valu', instr=('>>', tmp2, tmp2, v_two),
+                    dst=tmp2, dep_srcs=[tmp2, v_two],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_b2)
+                s += 1
+
+                # FLOW: nv_buf = b2 ? B_1 : B_0  → final node value
+                op_final = Op(
+                    engine='flow', instr=('vselect', nv_buf, tmp2, tmp1, nv_buf),
+                    dst=nv_buf, dep_srcs=[tmp2, tmp1, nv_buf],
+                    context_id=ctx, round_id=r, stage=s,
+                )
+                ctx_ops.append(op_final)
                 s += 1
             # software_nv rounds 0,11 and wrap round 10: nv = v_nv_root (constant vector),
             # no nv_buf write — XOR op will reference v_nv_root directly.
@@ -517,11 +638,18 @@ def build_op_graph(contexts, rounds, scratch, hsc_new, v_fp, v_one, v_two, v_nno
                 else:
                     # Full standard nav: gi_double + nav A/B/C/D
                     # Gi-doubler: idx = idx * 2 + 1
+                    # For level3: op_path and op_path2 READ idx_buf; gi_double WRITES it.
+                    # Without an explicit dep, gi_double could be scheduled before those reads.
+                    # Add nv_buf to dep_srcs: last_writer[nv_buf]=op_final (last level3 op),
+                    # which chains through all level3 reads of idx_buf. ✓
+                    gi_double_dep_srcs = [idx_buf, v_two, v_one]
+                    if rc == 'level3':
+                        gi_double_dep_srcs = gi_double_dep_srcs + [nv_buf]
                     op_gi_double = Op(
                         engine='valu',
                         instr=('multiply_add', idx_buf, idx_buf, v_two, v_one),
                         dst=idx_buf,
-                        dep_srcs=[idx_buf, v_two, v_one],
+                        dep_srcs=gi_double_dep_srcs,
                         context_id=ctx, round_id=r, stage=s,
                     )
                     ctx_ops.append(op_gi_double)
@@ -706,6 +834,8 @@ def round_class(round_id: int) -> str:
         return 'wrap'
     if round_id == 15:
         return 'last'
+    if round_id in (3, 14):
+        return 'level3'
     return 'scatter'
 
 
@@ -1089,6 +1219,7 @@ class KernelBuilder:
         c0 = self.scratch_const(0, "c0")
         c1 = self.scratch_const(1, "c1")
         c2 = self.scratch_const(2, "c2")
+        c7 = self.scratch_const(7, "c7")   # for level3 v_seven broadcast
         # c_nn / v_nnodes removed: nav_c/nav_d dead-code elimination made them unused.
         # Frees 9 scratch words (1 scalar + 8 vector) for Level2 FLOW→VALU constants.
 
@@ -1350,10 +1481,49 @@ class KernelBuilder:
             ('-', v_diff_F, v_nv[5], v_nv[4]),
         ]})
 
+        # ── Level3 constants: node values for rounds 3, 14 (depth-3 nodes 7–14) ──
+        # Nodes 7–14 are reached when idx_buf ∈ [7..14] (tree depth 3).
+        # path = idx - 7 ∈ [0..7]; 3-level binary mux selects the correct node value.
+        # Precompute: v_nv_d3[j] = broadcast(node_val[7+j]), j=0..7
+        #   v_seven = broadcast(7) for path extraction
+        #   4 diff vectors for bottom-level multiply_add: A_ij = b0*(nv_base+1 - nv_base) + nv_base
+        s_nv_d3 = [self.alloc_scratch(f"s_nv_d3_{j}") for j in range(8)]
+        v_nv_d3 = [self.alloc_scratch(f"v_nv_d3_{j}", VLEN) for j in range(8)]
+        v_seven  = self.alloc_scratch("v_seven", VLEN)
+        v_d3_A00 = self.alloc_scratch("v_d3_A00", VLEN)   # nv[8]  - nv[7]
+        v_d3_A01 = self.alloc_scratch("v_d3_A01", VLEN)   # nv[10] - nv[9]
+        v_d3_A10 = self.alloc_scratch("v_d3_A10", VLEN)   # nv[12] - nv[11]
+        v_d3_A11 = self.alloc_scratch("v_d3_A11", VLEN)   # nv[14] - nv[13]
+
+        # Step 1: compute addresses s_nv_d3[j] = forest_ptr + (7+j) via add_imm (FLOW)
+        for j in range(8):
+            self.instrs.append({"flow": [("add_imm", s_nv_d3[j], fvp, 7 + j)]})
+
+        # Step 2: load node_val[7..14] (self-referential)
+        load_d3 = [("load", s_nv_d3[j], s_nv_d3[j]) for j in range(8)]
+        for i in range(0, len(load_d3), 2):
+            self.instrs.append({"load": load_d3[i:i + 2]})
+
+        # Step 3: broadcast node_val[7..14] + v_seven (9 ops, 2 cycles at 6/cycle)
+        vb_d3 = [("vbroadcast", v_nv_d3[j], s_nv_d3[j]) for j in range(8)] + [
+            ("vbroadcast", v_seven, c7),
+        ]
+        for i in range(0, len(vb_d3), VALU_LIMIT):
+            self.instrs.append({"valu": vb_d3[i:i + VALU_LIMIT]})
+
+        # Step 4: compute 4 diff vectors (1 cycle, 4 VALU ops)
+        self.instrs.append({"valu": [
+            ('-', v_d3_A00, v_nv_d3[1], v_nv_d3[0]),
+            ('-', v_d3_A01, v_nv_d3[3], v_nv_d3[2]),
+            ('-', v_d3_A10, v_nv_d3[5], v_nv_d3[4]),
+            ('-', v_d3_A11, v_nv_d3[7], v_nv_d3[6]),
+        ]})
+
         # ── Spec 06: DAG-based multi-context scheduler ────────────────────────
         # Replace hand-scheduled quadruplet loop with greedy list scheduler.
-        # group_size=16: 16 contexts × 48 words = 768 words; dag_base ~697, 697+768=1465 ≤ 1536.
-        group_size = 32
+        # group_size=16: required by WORDS_PER_CTX=32 (level3 tmp3) to avoid scratch overflow.
+        # 16 contexts × 32 words = 512; dag_base ~879, 879+512=1391 ≤ 1536.
+        group_size = 16
         dag_base_offset = self.scratch_ptr
         assert dag_base_offset + group_size * ScratchLayout.WORDS_PER_CTX <= SCRATCH_SIZE, (
             f"DAG scratch overflow: need {dag_base_offset + group_size * ScratchLayout.WORDS_PER_CTX}, "
@@ -1395,6 +1565,15 @@ class KernelBuilder:
                 v_nv6=v_nv[6],
                 v_diff_T=v_diff_T,
                 v_diff_F=v_diff_F,
+                v_seven=v_seven,
+                v_nv7=v_nv_d3[0],
+                v_nv9=v_nv_d3[2],
+                v_nv11=v_nv_d3[4],
+                v_nv13=v_nv_d3[6],
+                v_d3_A00=v_d3_A00,
+                v_d3_A01=v_d3_A01,
+                v_d3_A10=v_d3_A10,
+                v_d3_A11=v_d3_A11,
             )
             # ── Store integration: add vstore ops into the DAG ────────────────
             # Build set of all val_buf lane addresses across all contexts.
